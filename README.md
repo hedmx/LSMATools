@@ -125,7 +125,7 @@ project/
 
 ### Case 1: L5/S1 起始场景（高分辨率 HR，0.5mm）
 
-![Case 1 - L5/S1 起始](examples/Clumbar_T2_TSE_DIXON_SAG_W_0005_TRACED.png)
+![Case 1 - L5/S1 起始](examples/data/Clumbar_T2_TSE_DIXON_SAG_W_0005_TRACED.png)
 
 **图像特征**:
 - ✅ **序列类型**: T2 Dixon W（压脂图）
@@ -143,7 +143,7 @@ project/
 
 ### Case 2: 胸腰段联合扫描（标准分辨率 STD，0.8mm，并行采集 P2）
 
-![Case 2 - 胸腰段联合](examples/Clumbar_T2_TSE_DIXON_SAG_P2_320_W_0008_TRACED.png)
+![Case 2 - 胸腰段联合](examples/data/Clumbar_T2_TSE_DIXON_SAG_P2_320_W_0008_TRACED.png)
 
 **图像特征**:
 - ✅ **序列类型**: T2 Dixon W（压脂图，并行采集）

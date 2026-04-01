@@ -48,6 +48,12 @@ test_output/
 *_masks.nii.gz
 *_LOG.json
 
+# 但允许 examples/data 目录下的示例文件（用于 GitHub 展示）
+!examples/data/*.png
+!examples/data/*.csv
+!examples/data/*.json
+!examples/data/*.nii.gz
+
 # OS
 .DS_Store
 Thumbs.db
