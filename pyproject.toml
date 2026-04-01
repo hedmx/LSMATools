@@ -1,0 +1,143 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "LSMATOOLS"
+version = "15.0.0"
+description = "Lumbar Spine MRI Analysis Tools - Automated segmentation and analysis of lumbar vertebrae"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "LSMATOOLS Contributors", email = "contact@lsma.tools"}
+]
+maintainers = [
+    {name = "LSMATOOLS Contributors", email = "contact@lsma.tools"}
+]
+keywords = [
+    "medical-imaging",
+    "mri",
+    "lumbar-spine",
+    "vertebrae-segmentation",
+    "endplate-detection",
+    "spinal-cord",
+    "image-analysis",
+    "computer-vision"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "scikit-image>=0.18.0",
+    "nibabel>=3.2.0",
+    "matplotlib>=3.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/LSMATOOLS_git"
+Documentation = "https://github.com/yourusername/LSMATOOLS_git/tree/main/docs"
+Repository = "https://github.com/yourusername/LSMATOOLS_git.git"
+Issues = "https://github.com/yourusername/LSMATOOLS_git/issues"
+Changelog = "https://github.com/yourusername/LSMATOOLS_git/releases"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+docs = [
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+    "myst-parser>=1.0.0",
+]
+notebook = [
+    "jupyter>=1.0.0",
+    "ipywidgets>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["LSMATOOLS_CP*"]
+
+[tool.setuptools.package-data]
+LSMATOOLS_CP = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "W503"]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --cov=LSMATOOLS_CP --cov-report=term-missing"
+testpaths = [
+    "tests",
+]
+
+[tool.coverage.run]
+source = ["LSMATOOLS_CP"]
+omit = [
+    "*/tests/*",
+    "*/examples/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific output
+output*/
+batch_output*/
+lumbar_fatsat_screener_results/
+lumbar_spinal_cord_results/
+lumbar_spinal_cord_roi/
+spinal_cord_roi_results*/
+out*/
+test_output/
+*.png
+*.nii.gz
+*_coords.csv
+*_masks.nii.gz
+*_LOG.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
