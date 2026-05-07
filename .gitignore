@@ -1,30 +1,10 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+*.pyo
 *.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-venv/
-env/
-ENV/
-.venv
+dist/
+build/
 
 # IDE
 .vscode/
@@ -33,31 +13,33 @@ ENV/
 *.swo
 *~
 
-# Project specific output
-output*/
+# OS
+.DS_Store
+Thumbs.db
+
+# Output directories (runtime generated)
+wifs_output/
+*_output/
+test_output/
 batch_output*/
 lumbar_fatsat_screener_results/
 lumbar_spinal_cord_results/
 lumbar_spinal_cord_roi/
 spinal_cord_roi_results*/
 out*/
-test_output/
-*.png
+
+# Data (NIfTI images, etc.)
 *.nii.gz
-*_coords.csv
-*_masks.nii.gz
+*.nii
+
+# Logs
+*.log
 *_LOG.json
 
-# 但允许 examples/data 目录下的示例文件（用于 GitHub 展示）
-!examples/data/*.png
-!examples/data/*.csv
-!examples/data/*.json
-!examples/data/*.nii.gz
+# Jupyter
+.ipynb_checkpoints/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Temporary files
-*.tmp
-*.log
+# Virtual env
+venv/
+.venv/
+env/

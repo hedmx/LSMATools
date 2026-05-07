@@ -13,6 +13,7 @@ from skimage.morphology import skeletonize, disk
 
 from .cortical_line import build_cortical2, extend_cortical2_tail
 from .scan_lines_v15 import build_scan_lines_v15, convert_to_arc_coord
+from config.params import CANAL_MIN_AREA_MM2, MAX_CANAL_WIDTH_MM, SMOOTH_MM_C2, SMOOTH_MM_C3
 
 class SpinalCanalProcessor:
     """椎管分割、边界追踪、终板检测一体化 - V9版本"""
@@ -92,7 +93,7 @@ class SpinalCanalProcessor:
         canal_seed = np.zeros_like(img_raw, dtype=bool)
         
         # V14_2: 最小面积门槛（避免小噪声）
-        min_area_px = int(300 / (self.pixel_spacing ** 2))  # ~300mm²
+        min_area_px = int(CANAL_MIN_AREA_MM2 / (self.pixel_spacing ** 2))  # ~300mm²
 
         def _extract_best_region(r0, r1):
             """在 [r0,r1) 行、[col_start,col_end) 列内做 Otsu + 保留所有合理连通域"""
@@ -138,6 +139,83 @@ class SpinalCanalProcessor:
             return None
         return canal_seed
     
+    def find_dorsal_edge_seed(self, img_raw, mask_left, mask_right, row):
+        """
+        背部边缘检测（种子行专用版）
+
+        两步策略：
+          步骤1：从 mask_right 向右扫描 10mm，滑动窗口大小=2
+                 当窗口均值 > 种子掩模行信号均值 × 0.6 时，更新 best_col（背侧起始锚点）
+                 若无窗口满足条件，直接返回 mask_right
+          步骤2：从 best_col 向右最多扫描 10mm，以 best_col 处信号值为基准，
+                 找第一个下降 >= 40% 的落差点直接返回
+          兜底：找不到落差点则返回 mask_right
+        """
+        h, w = img_raw.shape
+
+        # ── 步骤1：向右扫描 10mm，滑动窗口（大小2）找锚点 ──
+        scan_10mm = max(2, int(10.0 / self.pixel_spacing))
+        scan_end = min(mask_right + scan_10mm, w)
+
+        if scan_end <= mask_right + 1:
+            return mask_right
+
+        segment = img_raw[row, mask_right:scan_end].astype(np.float32)
+        if len(segment) < 2:
+            return mask_right
+
+        # 种子行平均信号（该行种子掩模覆盖列范围内的信号均值）
+        seed_mean = float(np.mean(img_raw[row, mask_left:mask_right + 1].astype(np.float32))) if mask_right > mask_left else 1.0
+
+        best_col = mask_right  # 兜底：未找到满足条件的窗口
+        best_avg = -1.0
+        found_anchor = False
+        for i in range(len(segment) - 1):
+            avg = (float(segment[i]) + float(segment[i + 1])) / 2.0
+            if avg > seed_mean * 0.6 and avg > best_avg:
+                best_avg = avg
+                best_col = mask_right + i  # 更新锚点列
+                found_anchor = True
+
+        # 步骤1未找到满足条件的锚点 → 从 mask_right 出发做步骤2扫描
+        if not found_anchor:
+            best_col = mask_right
+            ref_signal = float(img_raw[row, mask_right]) if mask_right < w else seed_mean
+            ref_signal = max(ref_signal, 1.0)
+            drop_threshold = 0.40
+            scan2_end = min(w, mask_right + max(2, int(10.0 / self.pixel_spacing)))
+            segment2 = img_raw[row, mask_right:scan2_end].astype(np.float32)
+            for i in range(1, len(segment2)):
+                drop_ratio = (ref_signal - float(segment2[i])) / (ref_signal + 1e-6)
+                if drop_ratio >= drop_threshold:
+                    return mask_right + i, None  # best_col=None 表示步骤1未找到锚点
+            return mask_right, None
+
+        # ref_signal：锚点处的信号值
+        ref_signal = float(img_raw[row, best_col]) if best_col < w else seed_mean
+        ref_signal = max(ref_signal, 1.0)
+
+        # ── 步骤2：从 best_col 向右最多扫描 10mm，找第一个落差点 ──
+        drop_threshold = 0.40
+        scan2_end = min(w, best_col + max(2, int(10.0 / self.pixel_spacing)))
+        segment2 = img_raw[row, best_col:scan2_end].astype(np.float32)
+
+        if len(segment2) >= 5:
+            from scipy import signal as scipy_signal
+            wl = min(9, len(segment2))
+            if wl % 2 == 0:
+                wl -= 1
+            wl = max(3, wl)
+            segment2 = scipy_signal.savgol_filter(segment2, window_length=wl, polyorder=2)
+
+        for i in range(1, len(segment2)):
+            drop_ratio = (ref_signal - float(segment2[i])) / (ref_signal + 1e-6)
+            if drop_ratio >= drop_threshold:
+                return best_col + i, best_col  # (dorsal_edge, best_col)
+
+        # 兜底：未找到落差点返回 mask_right，best_col 仍返回（锚点已找到但无落差）
+        return mask_right, best_col
+
     def find_dorsal_edge(self, img_raw, start_col, row):
         """
         背部边缘检测（斜率比较版）
@@ -199,7 +277,7 @@ class SpinalCanalProcessor:
             return start_col
         
         # 继续向右扫描固定距离（7mm），比较斜率
-        compare_distance = max(7, int(5 / self.pixel_spacing))
+        compare_distance = max(7, int(7 / self.pixel_spacing))
         search_end = min(first_drop_idx + compare_distance, len(smoothed) - 1)
         
         best_idx = first_drop_idx
@@ -286,7 +364,90 @@ class SpinalCanalProcessor:
         mid_col = start_col_in_original - best_center
         
         return mid_col
-    
+
+    def find_csf_mid_from_mask(self, img_raw, row, mask_left, mask_right):
+        """
+        基于种子掩模列范围直接定位 CSF 中心列（与背侧线解耦）。
+
+        方案C：先检测骨髓低信号谷底，若存在则只在谷底左侧的腹侧CSF段内找最高信号；
+        若不存在谷底，则在完整掩模范围内找最高信号段（兜底逻辑）。
+        Returns: csf_mid 列坐标（原图坐标系），None 表示失败。
+        """
+        if mask_right <= mask_left:
+            return None
+
+        h, w = img_raw.shape
+        mask_left  = int(np.clip(mask_left,  0, w - 1))
+        mask_right = int(np.clip(mask_right, 0, w - 1))
+
+        segment = img_raw[row, mask_left:mask_right + 1].astype(np.float32)
+        seg_len = len(segment)
+        if seg_len < 3:
+            return (mask_left + mask_right) // 2
+
+        # 平滑
+        wl = min(5, seg_len) if seg_len >= 5 else seg_len
+        if wl % 2 == 0:
+            wl = max(1, wl - 1)
+        if wl >= 3:
+            smoothed = signal.savgol_filter(segment, window_length=wl, polyorder=2)
+            smoothed = np.clip(smoothed, 0, None)
+        else:
+            smoothed = segment.copy()
+
+        # ── 方案C：检测骨髓低信号谷底，限制搜索范围在谷底左侧 ──
+        seg_min = float(np.min(smoothed))
+        seg_max = float(np.max(smoothed))
+        # 动态阈值：低于信号动态范围30%处视为骨髓低信号谷底
+        valley_thresh = seg_min + (seg_max - seg_min) * 0.3
+        min_valley_px = max(2, int(1.5 / self.pixel_spacing))  # 谷底至少持续1.5mm
+
+        search_right = seg_len  # 默认搜索整个范围
+        # 从左向右扫描，找第一个持续低信号谷底
+        i = 0
+        while i < seg_len - min_valley_px:
+            if smoothed[i] < valley_thresh:
+                # 检查是否持续 min_valley_px 个点
+                end_i = i
+                while end_i < seg_len and smoothed[end_i] < valley_thresh:
+                    end_i += 1
+                if end_i - i >= min_valley_px:
+                    # 找到谷底：限制搜索范围在谷底左边界左侧
+                    search_right = i  # 不包含谷底本身
+                    break
+                else:
+                    i = end_i  # 跳过短暂低信号
+            else:
+                i += 1
+
+        # 若谷底左侧范围太小（<3px），放弃限制，用完整范围
+        if search_right < 3:
+            search_right = seg_len
+
+        # ── 在有效范围内用滑动窗口找最高信号段 ──
+        window_size = max(3, int(3.0 / self.pixel_spacing))
+        window_size = min(window_size, search_right)
+
+        if window_size < 1:
+            return mask_left + search_right // 2
+
+        global_std = float(np.std(smoothed[:search_right]))
+        best_avg   = -1.0
+        best_center_offset = search_right // 2  # 兜底取搜索范围中间
+
+        for start in range(0, search_right - window_size + 1):
+            end = start + window_size
+            win = smoothed[start:end]
+            win_avg = float(np.mean(win))
+            win_std = float(np.std(win))
+            if global_std > 0 and win_std > global_std * 1.5:
+                continue
+            if win_avg > best_avg:
+                best_avg = win_avg
+                best_center_offset = start + window_size // 2
+
+        return mask_left + best_center_offset
+
     def find_ventral_edge(self, img_raw, row, csf_mid_col, csf_stack=None):
         """
         皮质线检测算法 V12.3
@@ -312,8 +473,8 @@ class SpinalCanalProcessor:
         high_mean = float(np.mean(img_raw[row, csf_left:csf_right + 1].astype(np.float32)))
         high_mean = max(high_mean, 1.0)  # 防除零
 
-        # ── 2. 扫描范围：csf_mid_col 向左最多30mm ──
-        scan_distance_px = max(20, int(30.0 / self.pixel_spacing))
+        # ── 2. 扫描范围：csf_mid_col 向左最多MAX_CANAL_WIDTH_MM ──
+        scan_distance_px = max(20, int(MAX_CANAL_WIDTH_MM / self.pixel_spacing))
         left_limit = max(0, csf_mid_col - scan_distance_px)
 
         if csf_mid_col - left_limit < 5:
@@ -324,7 +485,7 @@ class SpinalCanalProcessor:
         if len(profile) < 10:
             return max(5, (csf_mid_col + left_limit) // 2)
 
-        wl = min(9, len(profile)) if len(profile) >= 5 else len(profile)
+        wl = min(5, len(profile)) if len(profile) >= 5 else len(profile)
         if wl % 2 == 0:
             wl -= 1
         wl = max(3, wl)
@@ -392,8 +553,13 @@ class SpinalCanalProcessor:
         if dorsal_edge < min_canal_px:
             return None
 
-        left_profile = img_raw[row, :dorsal_edge + 1][::-1]
-        csf_mid = self.find_highest_csf_segment(left_profile, dorsal_edge)
+        # ── CSF中心：有掩模时从掩模列范围取（与背侧线解耦），无掩模时从背侧线左侧取 ──
+        if mask_bounds is not None:
+            mask_left, mask_right = mask_bounds
+            csf_mid = self.find_csf_mid_from_mask(img_raw, row, mask_left, mask_right)
+        else:
+            left_profile = img_raw[row, :dorsal_edge + 1][::-1]
+            csf_mid = self.find_highest_csf_segment(left_profile, dorsal_edge)
 
         if csf_mid is None:
             ventral_edge = dorsal_edge - 8
@@ -408,18 +574,19 @@ class SpinalCanalProcessor:
             mask_left, mask_right = mask_bounds
             ventral_edge = max(ventral_edge, mask_left)
 
-        # 椎管宽度合理性检验（3-30mm）
+        # 椎管宽度合理性检验（3mm ~ MAX_CANAL_WIDTH_MM）
         width_mm = (dorsal_edge - ventral_edge) * self.pixel_spacing
-        if width_mm < 3.0 or width_mm > 30.0:
+        if width_mm < 3.0 or width_mm > MAX_CANAL_WIDTH_MM:
             return None
 
         return dorsal_edge, ventral_edge, csf_mid
 
-    def trace_by_profile(self, canal_seed, img_raw, skip_upward=False):
+    def trace_by_profile(self, canal_seed, img_raw, skip_upward=False, csf_hints=None):
         """
         逐行扫描追踪椎管边界 - 滑动窗口法
         先追踪种子区域（向下），再从种子顶端向上动态扩展。
         skip_upward=True 时跳过阶段2向上扩展（种子已覆盖完整范围时使用）。
+        csf_hints - 全零回退掩模截断行的 CSF 中心锚点 {row: col}，优先于信号检测。
         """
         if not np.any(canal_seed):
             return None, None, None, None, None
@@ -439,31 +606,42 @@ class SpinalCanalProcessor:
         valid_rows_down    = []
         csf_mid_down       = []
         csf_stack_down     = []   # 阶段1独立堆栈
+        best_col_points    = []   # 阶段1每行 best_col 锚点（用于可视化）
 
         for row in range(row_min, row_max + 1):
             row_cols = cols[rows == row]
             if len(row_cols) == 0:
                 continue
             
-            # 提取该行掩模左右边界（作为线0）
+            # 提取该行掩模左右边界（作为约束）
             mask_left = np.min(row_cols)
             mask_right = np.max(row_cols)
-            
-            # ── 背部线：直接用掩模右边界（线0），跳过灰度扫描 ──
-            dorsal_edge = mask_right
-            
-            left_profile = img_raw[row, :dorsal_edge+1][::-1]
-            csf_mid = self.find_highest_csf_segment(left_profile, dorsal_edge)
-            
+
+            # ── 背部线：种子行专用两步扫描 ──
+            # 步骤1：向右10mm找信号峰值锚点；步骤2：从锚点找第一个落差点
+            dorsal_edge, best_col = self.find_dorsal_edge_seed(img_raw, mask_left, mask_right, row)
+            # 不能比掩模右边界更靠左（保底兜底）
+            dorsal_edge = max(dorsal_edge, mask_right)
+            # 收集 best_col 锚点（None 表示步骤1未找到）
+            if best_col is not None:
+                best_col_points.append((row, best_col))
+
+            # ── CSF中心：直接从种子掩模列范围取，与背侧线解耦 ──
+            # 若该行在 csf_hints 中，直接使用锚点（绕过信号检测）
+            if csf_hints and row in csf_hints:
+                csf_mid = int(csf_hints[row])
+            else:
+                csf_mid = self.find_csf_mid_from_mask(img_raw, row, mask_left, mask_right)
+
             if csf_mid is None:
-                ventral_edge = dorsal_edge - 8
+                ventral_edge = mask_left
             else:
                 ventral_edge = self.find_ventral_edge(img_raw, row, csf_mid,
                                                       csf_stack=csf_stack_down)
                 if ventral_edge is not None:
                     csf_mid_down.append((row, csf_mid))
                 else:
-                    ventral_edge = dorsal_edge - 8
+                    ventral_edge = mask_left
             
             # ── 皮质线1约束：不能比掩模左边界更靠左 ──
             ventral_edge = max(ventral_edge, mask_left)
@@ -530,13 +708,13 @@ class SpinalCanalProcessor:
         csf_mid_points = csf_mid_up + csf_mid_down
 
         if len(valid_rows) == 0:
-            return None, None, None, None, None
+            return None, None, None, None, None, []
 
         print(f"   椎管追踪: 种子行 {row_min}-{row_max}, "
               f"向上扩展至行 {min(valid_rows_up) if valid_rows_up else row_min}, "
               f"共 {len(valid_rows)} 行")
         
-        return traced, dorsal_edges, ventral_edges, valid_rows, csf_mid_points
+        return traced, dorsal_edges, ventral_edges, valid_rows, csf_mid_points, best_col_points
     
     def calculate_roi_points(self, traced, dorsal_edges, ventral_edges, 
                             valid_rows, csf_mid_points, img_raw):
@@ -595,7 +773,7 @@ class SpinalCanalProcessor:
         if canal_seed is None or not np.any(canal_seed):
             return None, None, None, "椎管分割失败", None
     
-        traced, dorsal_edges, ventral_edges, valid_rows, csf_mid = \
+        traced, dorsal_edges, ventral_edges, valid_rows, csf_mid, _best_col_pts = \
             self.trace_by_profile(canal_seed, img_raw)
     
         if traced is None or not np.any(traced):
@@ -611,7 +789,7 @@ class SpinalCanalProcessor:
         # ===== V12：背部线平滑 + 皮质线梳理 + 扫描线分析 =====
         # 背部线平滑
         smooth_dorsal_cols, dorsal_all_rows = self.smooth_dorsal_line(dorsal_edges, valid_rows)
-    
+
         v9_data = self.analyze_endplates(ventral_edges, valid_rows, img_raw)
         if v9_data is not None:
             v9_data['smooth_dorsal_cols'] = smooth_dorsal_cols
@@ -620,10 +798,21 @@ class SpinalCanalProcessor:
             v9_data['raw_ventral_edges']  = list(ventral_edges)
             v9_data['raw_ventral_rows']   = list(valid_rows)
             v9_data['csf_mid_points']     = list(csf_mid)  # [(row, col), ...]
-    
+
+        # ── 用皮质线1（smooth_cols，小窗口平滑）+ 背侧线重建椎管掩膜 ──
+        if v9_data is not None:
+            c1_ventral_cols = v9_data.get('smooth_cols')
+            c1_ventral_rows = np.array(v9_data['all_rows']) if 'all_rows' in v9_data else None
+            if (c1_ventral_cols is not None and smooth_dorsal_cols is not None
+                    and len(c1_ventral_cols) > 0 and len(smooth_dorsal_cols) > 0):
+                traced = self._rebuild_traced_from_smooth(
+                    traced, img_raw.shape,
+                    c1_ventral_cols, c1_ventral_rows,
+                    smooth_dorsal_cols, dorsal_all_rows)
+
         return traced, roi_points, valid_rows, status, v9_data
         
-    def process_with_mask(self, img_raw, green_mask, canal_seed, merged_regions=None):
+    def process_with_mask(self, img_raw, green_mask, canal_seed, merged_regions=None, csf_hints=None):
         """
         使用预设绿色掩模进行椎管处理（V14_2 增强流程）。
         
@@ -636,6 +825,7 @@ class SpinalCanalProcessor:
             green_mask     - 精选椎管掩模（追踪种子，排除盆腔干扰）
             canal_seed     - 完整 segment_initial 掩模（备用，暂不参与追踪）
             merged_regions - Step3 合并的区域列表，None 表示未合并
+            csf_hints      - 全零回退掩模截断行的 CSF 中心锚点 {row: col}，None 表示无
             
         返回：
             traced, roi_points, valid_rows, status, v9_data
@@ -645,9 +835,11 @@ class SpinalCanalProcessor:
         
         # 使用精选的 green_mask 作为追踪种子（Step1+Step2+Step3 合并后，已排除盆腔）
         print(f"\n[V14_2] Using merged green_mask (area={np.sum(green_mask)}px) for processing...")
+        if csf_hints:
+            print(f"   [V14_2] csf_hints 覆盖行数={len(csf_hints)}")
         
-        traced, dorsal_edges, ventral_edges, valid_rows, csf_mid = \
-            self.trace_by_profile(green_mask, img_raw, skip_upward=True)
+        traced, dorsal_edges, ventral_edges, valid_rows, csf_mid, best_col_points = \
+            self.trace_by_profile(green_mask, img_raw, skip_upward=True, csf_hints=csf_hints)
         
         if traced is None or not np.any(traced):
             return None, None, None, "边界追踪失败", None
@@ -662,7 +854,7 @@ class SpinalCanalProcessor:
         # ===== V12：背部线平滑 + 皮质线梳理 + 扫描线分析 =====
         # 背部线平滑
         smooth_dorsal_cols, dorsal_all_rows = self.smooth_dorsal_line(dorsal_edges, valid_rows)
-    
+
         v9_data = self.analyze_endplates(ventral_edges, valid_rows, img_raw)
         if v9_data is not None:
             v9_data['smooth_dorsal_cols'] = smooth_dorsal_cols
@@ -670,7 +862,19 @@ class SpinalCanalProcessor:
             v9_data['raw_ventral_edges']  = list(ventral_edges)
             v9_data['raw_ventral_rows']   = list(valid_rows)
             v9_data['csf_mid_points']     = list(csf_mid)
-    
+            v9_data['best_col_points']    = list(best_col_points)  # 阶段1 best_col 锚点
+
+        # ── 用皮质线1（smooth_cols，小窗口平滑）+ 背侧线重建椎管掩膜 ──
+        if v9_data is not None:
+            c1_ventral_cols = v9_data.get('smooth_cols')
+            c1_ventral_rows = np.array(v9_data['all_rows']) if 'all_rows' in v9_data else None
+            if (c1_ventral_cols is not None and smooth_dorsal_cols is not None
+                    and len(c1_ventral_cols) > 0 and len(smooth_dorsal_cols) > 0):
+                traced = self._rebuild_traced_from_smooth(
+                    traced, img_raw.shape,
+                    c1_ventral_cols, c1_ventral_rows,
+                    smooth_dorsal_cols, dorsal_all_rows)
+
         return traced, roi_points, valid_rows, status, v9_data
     
     # ================================================================
@@ -795,7 +999,7 @@ class SpinalCanalProcessor:
         interp_cols = np.interp(all_rows, clean_rows, clean_edges)
 
         # --- 轻度平滑（移动均往）---
-        k = max(3, int(5 / self.pixel_spacing))   # ~5mm平滑宽度
+        k = max(3, int(20 / self.pixel_spacing))   # ~20mm平滑宽度
         if k % 2 == 0:
             k += 1
         pad = k // 2
@@ -804,6 +1008,44 @@ class SpinalCanalProcessor:
         smooth_cols = np.convolve(padded, kernel, mode='valid')
 
         return smooth_cols.astype(np.float32), all_rows
+
+    def _rebuild_traced_from_smooth(self, traced_orig, img_shape,
+                                     smooth_ventral, ventral_rows,
+                                     smooth_dorsal,  dorsal_rows):
+        """
+        用平滑后的皮质线1（腹侧）和背侧线重建椎管掩膜，消除逐行检测噪声。
+        取两条线行范围的交集，在交集行内按平滑列重填；交集外保留原始 traced。
+        """
+        h, w = img_shape
+        traced_new = traced_orig.copy()
+
+        # 取行范围交集
+        v_row_min, v_row_max = int(ventral_rows[0]),  int(ventral_rows[-1])
+        d_row_min, d_row_max = int(dorsal_rows[0]),   int(dorsal_rows[-1])
+        row_min = max(v_row_min, d_row_min)
+        row_max = min(v_row_max, d_row_max)
+
+        if row_min >= row_max:
+            return traced_orig  # 无交集，不替换
+
+        # 建立行→列查找表（浮点 → int，clip 到图像边界）
+        v_lut = {int(r): int(np.clip(round(c), 0, w - 1))
+                 for r, c in zip(ventral_rows, smooth_ventral)}
+        d_lut = {int(r): int(np.clip(round(c), 0, w - 1))
+                 for r, c in zip(dorsal_rows,  smooth_dorsal)}
+
+        for row in range(row_min, row_max + 1):
+            v_col = v_lut.get(row)
+            d_col = d_lut.get(row)
+            if v_col is None or d_col is None:
+                continue
+            col_l = min(v_col, d_col)
+            col_r = max(v_col, d_col)
+            # 清除该行原始掩膜，用平滑线范围重填
+            traced_new[row, :] = False
+            traced_new[row, col_l:col_r + 1] = True
+
+        return traced_new
 
     def build_scan_lines(self, smooth_cols, all_rows, img_raw):
         """
@@ -1272,9 +1514,9 @@ class SpinalCanalProcessor:
         # 1. 皮质线1：小窗口平滑
         smooth_cols, all_rows = self.smooth_ventral_line(ventral_edges, valid_rows)
 
-        # 2. 皮质线2：50mm 强平滑
+        # 2. 皮质线2：SMOOTH_MM_C2 平滑（与 Mode4 皮质线2-2同源，用于椎管掩膜腹侧边）
         c2_cols, c2_rows = build_cortical2(
-            smooth_cols, all_rows, self.pixel_spacing, smooth_mm=50.0)
+            smooth_cols, all_rows, self.pixel_spacing, smooth_mm=SMOOTH_MM_C2)
 
         # 2.5 皮质线2下端延伸（切线方向基于皮质线1末端20mm回归）
         c2_cols, c2_rows = extend_cortical2_tail(
@@ -1283,28 +1525,39 @@ class SpinalCanalProcessor:
             extend_mm=10.0, tail_mm=20.0,
             ref_cols=smooth_cols, ref_rows=all_rows)
 
+        # 2.6 皮质线3：SMOOTH_MM_C3(40mm) 平滑，比皮质线2更平滑，用于终板聚类弧长坐标基准
+        c3_cols, c3_rows = build_cortical2(
+            smooth_cols, all_rows, self.pixel_spacing, smooth_mm=SMOOTH_MM_C3)
+        c3_cols, c3_rows = extend_cortical2_tail(
+            c3_cols, c3_rows, self.pixel_spacing,
+            img_shape=img_raw.shape,
+            extend_mm=10.0, tail_mm=20.0,
+            ref_cols=smooth_cols, ref_rows=all_rows)
+
         # 3. 建立平行扫描线（V12 兰山 供压水图坐标对齐使用）
         scan_lines = self.build_scan_lines(smooth_cols, all_rows, img_raw)
 
-        # 4. V15 切线方向扫描线（33条，基于皮质线2）
+        # 4. V15 切线方向扫描线（基于皮质线3，40mm平滑）
         scan_lines_v15 = build_scan_lines_v15(
-            c2_cols, c2_rows, img_raw.shape, self.pixel_spacing,
+            c3_cols, c3_rows, img_raw.shape, self.pixel_spacing,
             n_lines=40, step_mm=1.0)
-        # 计算皮质线2弧长数组（供聚类坐标系使用）
-        arc_len_mm = np.zeros(len(c2_rows), dtype=np.float64)
-        for i in range(1, len(c2_rows)):
-            dr = float(c2_rows[i] - c2_rows[i - 1])
-            dc = float(c2_cols[i] - c2_cols[i - 1])
+        # 计算皮质线3弧长数组（供终板聚类坐标系使用）
+        arc_len_mm = np.zeros(len(c3_rows), dtype=np.float64)
+        for i in range(1, len(c3_rows)):
+            dr = float(c3_rows[i] - c3_rows[i - 1])
+            dc = float(c3_cols[i] - c3_cols[i - 1])
             arc_len_mm[i] = arc_len_mm[i - 1] + np.sqrt(dr * dr + dc * dc) * self.pixel_spacing
 
         return {
             'smooth_cols':         smooth_cols,
             'all_rows':            all_rows,
             'scan_lines':          scan_lines,
-            'c2_cols':             c2_cols,        # V15 皮质线2
+            'c2_cols':             c2_cols,        # 皮质线2（20mm平滑，用于椎管掩膜）
             'c2_rows':             c2_rows,
-            'arc_len_mm':          arc_len_mm,     # V15 弧长坐标
-            'scan_lines_v15':      scan_lines_v15, # V15 切线方向扫描线
+            'c3_cols':             c3_cols,        # 皮质线3（40mm平滑，用于终板聚类）
+            'c3_rows':             c3_rows,
+            'arc_len_mm':          arc_len_mm,     # 弧长坐标（基于皮质线3）
+            'scan_lines_v15':      scan_lines_v15, # V15 切线方向扫描线（基于皮质线3）
             'all_candidates':      {},
             'consensus_endplates': [],
             'texture_case':        1,

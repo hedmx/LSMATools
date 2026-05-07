@@ -8,7 +8,7 @@ import re
 def _get_series_type(series_desc: str):
     """
     从 series_description 最后一个'_'之后的字符判断序列类型。
-    返回 'W'（压脂）/ 'F'（压水）/ None
+    返回 'W'（压脂）/ 'F'（压水）/ 'IN'（in-phase）/ None
     """
     if not series_desc or '_' not in series_desc:
         return None
@@ -17,6 +17,8 @@ def _get_series_type(series_desc: str):
         return 'W'
     if suffix in ('F', 'FAT'):
         return 'F'
+    if suffix in ('IN', 'INPHASE', 'IN_PHASE', 'IP'):
+        return 'IN'
     return None
 
 
@@ -31,3 +33,14 @@ def _get_series_number(folder_name: str) -> int:
     """从文件夹名末尾的数字提取 series number，如 T2_TSE_DIXON_SAG_W_0008 → 8"""
     m = re.search(r'_(\d+)$', folder_name)
     return int(m.group(1)) if m else 0
+
+
+def _is_dixon_sequence(series_desc: str) -> bool:
+    """
+    判断是否为 Dixon/WFI 序列（不区分大小写）。
+    兼容两种命名规范：
+      - 'dixon'：如 T2_TSE_DIXON_SAG_W
+      - 'wfi'  ：如 T2_TSE_WFI_SAG_W
+    """
+    d = series_desc.lower()
+    return 'dixon' in d or 'wfi' in d

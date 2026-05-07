@@ -3,3 +3,4 @@ scipy>=1.7.0
 scikit-image>=0.18.0
 nibabel>=3.2.0
 matplotlib>=3.4.0
+roifile>=2022.0  # optional: for Fiji ROI export

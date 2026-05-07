@@ -1,29 +1,32 @@
 # LSMATools - Lumbar Spine MRI Analysis Tools
 
-**智能腰椎 MRI 分析工具** | Automated Lumbar Spine MRI Segmentation and Analysis
+**腰椎矢状位 MRI 自动分割与几何量化工具** | Automated Lumbar Spine MRI Segmentation and Geometric Quantification
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Version](https://img.shields.io/badge/version-V15.5-green.svg)](https://github.com/hedmx/LSMATools)
 
 ---
 
-## 📖 简介 (Introduction)
+## 简介 (Introduction)
 
-LSMATools 是一个基于 Python 的腰椎 MRI 图像智能分析工具，专为医学影像研究人员设计。它能够自动识别椎体结构、检测终板位置、分析椎体前缘/后缘几何特征，并提供可视化的分析结果。
+LSMATools 是一套基于 T2 Dixon/WFI Water/同相位 双序列的腰椎 MRI 自动分割与几何量化工具。它能够自动识别椎管结构、检测终板位置、量化椎体前缘/后缘几何特征，并输出多种格式的分析结果。
 
-LSMATools is an intelligent lumbar MRI analysis tool designed for medical imaging researchers. It automatically identifies vertebral structures, detects endplate positions, analyzes anterior/posterior vertebral geometry, and provides visualized analysis results.
+### 核心功能 (Key Features)
 
-### 🔑 核心功能 (Key Features)
+- **自动切片优选** — V14_2 三步掩模合并 + 四重形态校验 + 相对评分（45/45/10）
+- **椎管自动追踪** — SpinalCanalProcessor 完整分割椎管，输出皮质线 1
+- **Mode4 同相位图膜态分割** — 加载同患者 IN/IP 序列，沿皮质线 2-2 扫描终板汇合点，disc 模式矩阵扫描终板 + 扇形扫描前缘
+- **椎体几何量化** — 输出四交点（AP_top/AP_bot/BP_top/BP_bot）及形态角度
+- **四种格式输出** — NIfTI 掩模（多标签）+ Fiji ROI ZIP + CSV 几何表 + PNG 可视化
+- **批量处理** — 全量模式 / 快速轻量模式，自动匹配 T2 Dixon/WFI W 序列
 
-- **自动椎管分割** - 基于 Otsu 阈值和形态学操作的椎管 ROI 提取
-- **终板智能检测** - 状态机驱动的上升沿/下降沿终板识别算法
-- **椎体前缘分析** - 双模态（压脂/压水）融合的前缘线检测
-- **椎体后缘分析** - 双皮质线体系的后缘角点定位
-- **脊髓 ROI 分析** - 自动化的脊髓区域分割与测量
-- **胸椎扩展识别** - 支持 L5/S1 → T12-T8 的自动命名
-- **可视化及几何数据输出** - 双图对比（左压脂/右压水），含完整标注
+### 适配设备 (Supported Devices)
 
-### 🎯 适用场景 (Use Cases)
+- **西门子 Dixon**：T2 Dixon 序列，`_W`（水相）+ `_IN` / `_INPHASE`（同相位）
+- **联影 WFI**：T2 WFI 序列，`_W`（水相）+ `_IP`（同相位）
+
+### 适用场景 (Use Cases)
 
 - 腰椎 MRI 图像的自动化预处理
 - 椎体几何参数的批量测量
@@ -33,547 +36,508 @@ LSMATools is an intelligent lumbar MRI analysis tool designed for medical imagin
 
 ---
 
-## 🚀 快速开始 (Quick Start)
+## 快速开始 (Quick Start)
 
-### 安装依赖 (Install Dependencies)
+### 安装依赖
 
 ```bash
+cd LSMATOOLS
 pip install -r requirements.txt
 ```
 
-### 基础用法 (Basic Usage)
-
-LSMATools V14 采用**命令行交互式**运行方式：
+### 命令行运行
 
 ```bash
-# 运行主程序（交互式菜单）
-python LSMATools.py
-
-# 选择运行模式：
-#   1. 单张图像测试 - 处理单个 NIfTI 文件
-#   2. 批量处理 - 批量处理多个病例
+python main.py
 ```
 
-#### 模式 1：单张图像测试
+启动后出现交互菜单：
 
-运行后输入 `1`，按提示输入：
-- NIfTI 文件路径
-- Metadata JSON 路径（如有）
+```
+LSMATools – 腰椎 WATER/同相位 序列膜态分割工具
+
+请选择处理模式:
+  1. 单张图像处理
+  2. 批量处理（全量分割模式：掩膜+CSV+日志+ROI+双图可视化）
+  3. 批量处理（快速轻量模式：掩膜+CSV+W图可视化，无ROI/单例日志）
+```
+
+#### 模式 1：单张图像处理
+
+输入 `1` 后按提示输入：
+- NIfTI 文件路径 或 序列目录（自动追加 `scan.nii.gz`）
+- metadata.json 路径（不存在时使用默认 pixel_spacing=0.9375mm）
 - 输出目录
 
-#### 模式 2：批量处理
+#### 模式 2：批量处理（全量）
 
-运行后输入 `2`，按提示输入：
-- 输入目录（包含多个子目录，每个子目录含 scan.nii.gz）
-- 输出目录
+输入 `2` 后按提示输入：
+- 输入父目录路径
 
-### 代码级使用 (Programmatic Usage)
+递归遍历输入目录，匹配 T2 Dixon/WFI W 序列，输出：四种文件（NIfTI掩模 + ROI ZIP + CSV + PNG）+ `batch_summary.json`
 
-如需在 Python 代码中调用：
+#### 模式 3：批量处理（快速）
+
+输入 `3` 后按提示输入：
+- 输入父目录路径
+
+同模式 2，但跳过 ROI ZIP 和单例日志，仅输出掩模 + CSV + 左图可视化，适用于大批量快速筛查。
+
+### Python 代码调用
 
 ```python
-from LSMATools import SpinalCanalProcessor, SpinalCordLocator
+import sys
+sys.path.insert(0, '/path/to/LSMATOOLS')
 
-# 1. 初始化处理器
-processor = SpinalCanalProcessor(pixel_spacing=0.5, meta={})
+from main import process_single
 
-# 2. 加载图像（需自行准备）
-img_w = nib.load('path/to/W.nii.gz')
-img_f = nib.load('path/to/F.nii.gz')
-
-# 3. 椎管分割
-mask = processor.segment_initial(img_w.get_fdata()[:, :, best_slice])
-
-# 4. 边界提取
-c1_cols, c1_rows = processor.extract_boundary(mask)
-
-# 5. 脊髓 ROI 定位
-locator = SpinalCordLocator(pixel_spacing=0.5)
-cord_roi = locator.locate_spinal_cord(img_w.get_fdata()[:, :, best_slice], c1_cols, c1_rows)
-
-# 6. 生成扫描线（V15）
-scan_lines_v15 = build_scan_lines_v15(c1_cols, c1_rows, pixel_spacing)
-
-# 7. 终板检测（需传入压水图）
-v9_data = find_endplates_on_water_image(scan_lines_f, f_img_2d, pixel_spacing)
-
-# 8. 可视化（调用 visualize_results 函数）
-visualize_results(...)
+result = process_single(
+    nifti_path='/path/to/T2_DIXON_W/scan.nii.gz',
+    metadata_path='/path/to/T2_DIXON_W/metadata.json',
+    output_dir='/path/to/output',
+    patient_dir='P12345',
+    seq_dir='T2_TSE_DIXON_SAG_W_0005',
+    fast_mode=False,
+)
+print(result)  # {'status': 'success', 'stem': '...', 'n_vertebrae': 5, ...}
 ```
 
-> 注意：完整的高级封装类（如 `LumbarSpineAnalyzer`）可在后续版本中添加，目前建议使用上述函数调用方式或交互式菜单。
+### 批量调用
+
+```python
+from main import process_batch, process_batch_fast
+
+# 全量模式
+process_batch('/path/to/input', '/path/to/output')
+
+# 快速模式
+process_batch_fast('/path/to/input', '/path/to/output')
+```
 
 ### 典型目录结构
 
 ```
-project/
-├── LSMATools.py              # 主程序
-├── requirements.txt          # 依赖
-└── data/
-    ├── case001/
-    │   ├── scan.nii.gz      # T2 Dixon W 图像
-    │   └── metadata.json    # 元数据（可选）
-    └── case002/
-        └── scan.nii.gz
+患者目录/
+├── T2_TSE_DIXON_SAG_W_0005/      # 压脂图（W 序列，西门子 Dixon / 联影 WFI）
+│   ├── scan.nii.gz
+│   └── metadata.json
+└── T2_TSE_DIXON_SAG_IN_0006/     # 同相位图（西门子 _IN / 联影 _IP，自动配对）
+    ├── scan.nii.gz
+    └── metadata.json
 ```
+
+`metadata.json` 至少包含：
+
+```json
+{
+  "acquisition_params": {
+    "pixel_spacing_mm": [0.9375, 0.9375]
+  },
+  "series_info": {
+    "series_description": "T2_TSE_DIXON_SAG_W_0005"
+  }
+}
+```
+
+> 若没有 `metadata.json`，系统使用默认像素间距 0.9375mm。
 
 ---
 
-## 📸 可视化预览 (Visualization Preview)
+## 输出说明 (Output Description)
 
-以下是 LSMATools V14 的典型输出示例（点击放大查看细节）：
+每个病例在 `output_dir/{patient}_{seq}/` 下生成：
 
-### Case 1: L5/S1 起始场景（高分辨率 HR，0.5mm）
+| 文件 | 格式 | 内容 |
+|------|------|------|
+| `{stem}_seg.nii.gz` | NIfTI | 多标签分割掩模（2D，S2 不纳入）|
+| `{stem}_roi.zip` | ZIP | Fiji ImagejRoi 格式，每个标签一个 .roi 文件 |
+| `{stem}_geom.csv` | CSV | 椎体几何形态表（四角点坐标/mm、角度、面积、椎管径）|
+| `{stem}_log.txt` | TXT | 完整处理日志（头部含处理时间戳）|
+| `{stem}_vis.png` | PNG | W图 + IN图双图可视化 |
 
-![Case 1 - L5/S1 起始](examples/data/Clumbar_T2_TSE_DIXON_SAG_W_0005_TRACED.png)
+批量输出：`output_dir/batch_summary.json`（含时间戳、成功失败统计、各病例处理详情）
 
-**图像特征**:
-- ✅ **序列类型**: T2 Dixon W（压脂图）
-- ✅ **像素间距**: 0.5mm（高分辨率）
-- ✅ **椎体链路**: S1 → L5 → L4 → L3 → L2 → L1（完整腰椎）
-- ✅ **可视化内容**:
-  - 白色实线：皮质线 1（椎管前壁）
-  - 紫色虚线：皮质线 1 二次平滑（所有扫描检测基准 + 椎体弧度可视化）
-  - 橙色实线：背部线（5mm 平滑增强）
-  - 橙/绿实线：上/下终板线
-  - 红色实线：双模态融合前缘线
-  - 黄色轮廓：脊髓 ROI
+### CSV 字段
 
----
+| 字段组 | 字段名 |
+|--------|--------|
+| 定位 | `slice_index`, `level` |
+| 四角点 | `BP_top/AP_top/AP_bot/BP_bot`（行/列/mm）|
+| 几何 | `centroid_row/col`, `area_px_count`, `area_geo_mm2` |
+| 角度 | `angle_sup/inf/c1/ant_deg` |
+| 高度 | `ant_height_mm`, `pos_height_mm` |
+| 椎管 | `canal_area_px/mm2`, `canal_ap_min/max/center_mm`, `canal_centroid_row/col` |
 
-### Case 2: 胸腰段联合扫描（标准分辨率 STD，0.8mm，并行采集 P2）
+### 掩模标签映射
 
-![Case 2 - 胸腰段联合](examples/data/Clumbar_T2_TSE_DIXON_SAG_P2_320_W_0008_TRACED.png)
+| 标签 | 值 |
+|------|-----|
+| S1 | 1 |
+| L5 | 2 |
+| L4 | 3 |
+| L3 | 4 |
+| L2 | 5 |
+| L1 | 6 |
+| T12 | 7 |
+| T11 | 8 |
+| ... | ... |
+| T9 | 10 |
+| CANAL | 15 |
 
-**图像特征**:
-- ✅ **序列类型**: T2 Dixon W（压脂图，并行采集）
-- ✅ **像素间距**: 0.8mm（标准分辨率）
-- ✅ **场强修正**: 并行采集 × 0.92
-- ✅ **椎体链路**: L5 → L4 → L3 → L2 → L1 → T12（包含胸椎）
-- ✅ **V14 新特性验证**:
-  - 胸椎命名扩展（T12 自动识别）
-  - 几何中心标注优化（文字位于椎体中心高度）
-  - 背部线平滑增强（与皮质线 1 参数一致）
-
----
-
-### 可视化语义说明 (Visualization Semantics)
-
-| 颜色 | 线条样式 | 解剖结构 | 备注 |
-|------|---------|---------|------|
-| ⚪ 白色 | 实线 | 皮质线 1（Cortical Line 1） | 椎管前壁高信号边界 |
-| 🟣 紫色 | 虚线 | 皮质线 1 二次平滑（Smoothed C1） | 所有扫描检测基准 + 椎体弧度可视化 |
-| 🟠 橙色 | 实线 | 背部线（Dorsal Line） | V14 增强：5mm 移动均值平滑 |
-| 🔴 番茄红 | 实线 | 上终板（Superior Endplate） | `ep_type='upper'` |
-| 🟢 草绿 | 实线 | 下终板（Inferior Endplate） | `ep_type='lower'` |
-| 🔴 红色 | 实线 | 前缘线（Anterior Edge） | 双模态融合输出（上升沿 + 下降沿） |
-| 🟡 黄色 | 轮廓线 | 脊髓 ROI（Spinal Cord ROI） | 骨髓区域分割结果 |
-| 🔵 深蓝 | 细实线 | 法线扫描线（V15） | 33 条，1mm 间距，右图调试显示 |
-
-**左图（压脂图）**: 最终输出视图，仅显示关键结构  
-**右图（压水图）**: 完整调试视图，包含所有中间态和检测点
+> S2 不纳入掩模。
 
 ---
 
-## 📊 输出说明 (Output Description)
+## 可视化预览 (Visualization Preview)
 
-### 可视化文件 (Visualization Files)
+### 左图（W 图）
 
-| 文件名模式 | 内容描述 |
-|-----------|---------|
-| `*_overlay.png` | 双图对比：左压脂 + 右压水，含所有标注 |
-| `*_left_only.png` | 仅压脂图（皮质线、终板线、前缘红线） |
-| `*_right_only.png` | 仅压水图（完整调试信息） |
+| 图层 | 颜色/样式 |
+|------|-----------|
+| 皮质线 1 | 白色实线 |
+| 皮质线 2-2 | 青色实线 |
+| 信号剖面采样线 | 白色虚线 |
+| 椎管轮廓 | 青色虚线 |
 
-### 数据标注 (Data Annotations)
+### 右图（同相位图 IN/IP）
 
-每个椎体输出以下参数：
+| 图层 | 颜色/样式 |
+|------|-----------|
+| 终板汇合点 | 黄色圆点 |
+| 椎间盘中心 | 品红菱形 |
+| 上终板线（实体段）| 草绿实线 |
+| 下终板线（实体段）| 番茄红实线 |
+| 终板延伸段 | 对应颜色虚线 |
+| 前缘线 | 天蓝色实线 |
+| 四边形轮廓 | 黄色实线 |
+| 四角点 | 橙色 × |
+| 名称标注 | 白色文字（黑底），含前缘角度/上终板角 |
 
-```
-{name}: {area_mm2:.1f}mm² | Sup:{ang_top:.1f}° Inf:{ang_bot:.1f}° C1:{ang_c1:.1f}° Ant:{ang_fr:.1f}°
-```
+### disc 模式可视化元素（同相位图额外）
 
-- **name**: 椎体名称 (L5/L4/L3/L2/L1/T12/T11/...)
-- **area_mm²**: 椎体截面积（平方毫米）
-- **Sup°**: 上终板角度
-- **Inf°**: 下终板角度
-- **C1°**: 皮质线 1 角度
-- **Ant°**: 前缘线角度
+| 元素 | 颜色/样式 |
+|------|-----------|
+| 掩模叠加 | 彩色半透明（按标签）|
+| 起点连线（完整宽度）| 白色细虚线 |
+| 扫描方向箭头 | 上=lime，下=salmon |
+| 前缘扇形（disc 模式）| deepskyblue 虚线 |
+| 候选点 | lime / salmon / deepskyblue 小圆点 |
 
 ---
 
-## 🧠 算法架构 (Algorithm Architecture)
+## 算法架构 (Algorithm Architecture)
 
-LSMATools V14 采用模块化设计，从输入到输出经历以下处理流程：
+LSMATools V15.5 采用模块化 6 层架构：
 
-### 系统总体流程 (System Overview)
+### 系统总体流程
 
 ```
-输入 (W 压脂图 NIfTI 3D)，推荐使用 https://github.com/hedmx/dicom_converter_enhanced 进行DICOM to NIfTI 转换。
-    │
-    ├─ [预处理] 序列筛选 + 最优切片选择
-    │       ├─ 几何硬约束过滤（列中心/宽高比/最小高度）
-    │       └─ 复合评分：垂直覆盖行数 × (1 + 0.2×形状分)
-    │
-    ├─ [SpinalCanalProcessor] 椎管分割 → 皮质线 1 + 皮质线 1 二次平滑
-    │       ├─ segment_initial(): 双区域 Otsu + 最大连通域 + 1px 膨胀
-    │       ├─ extract_boundary(): 骨骼化 + 追踪 → c1/c2 原始点
-    │       ├─ find_dorsal_edge(): 参考信号回退 5mm + 最大梯度点
-    │       └─ smooth_boundary(): MAD 过滤 + 线性插值 + 移动均值平滑
-    │
-    ├─ [SpinalCordLocator] 脊髓 ROI 定位
-    │
-    ├─ [V15 法线扫描线生成] 33 条扫描线（1mm 间距）
-    │       ├─ 逐点计算皮质线 1 局部切线（前后差分）
-    │       ├─ 切线顺时针旋转 90° 得法线 (nx, ny)
-    │       └─ 每条线沿法线方向偏移 k×step_mm（k=1..33）
-    │
-    └─ [压水图分析] F 序列
-            │
-            ├─ [仿射坐标对齐] 压脂 → 压水 扫描线映射
-            │
-            ├─ [终板检测] 
-            │       ├─ 三区信号统计（Otsu）→ high/low mean 1/2/3
-            │       ├─ 状态机下降沿/上升沿检测（含回退重扫）
-            │       ├─ 弧长坐标系聚类 → consensus_endplates
-            │       ├─ anatomical_gap_correction() 解剖间距复核
-            │       └─ fill_missing_endplates() 缺失插补
-            │
-            ├─ [前缘检测 - 上升沿主流程]
-            │       ├─ find_arc_roi_min_points() 谷底查找
-            │       └─ refine_arc_roi_to_anterior_edge() 上升沿精修
-            │               → arc_refined（含 refined/kept/kept_low flag）
-            │
-            ├─ [前缘检测 - 下降沿并行方案]
-            │       └─ find_anterior_edge_by_descent() 法线下降沿检测
-            │               ├─ 逐行插值映射 row→(base_col, nx, ny)
-            │               ├─ 终板段划分（lower_ep→上终板，upper_ep→下终板）
-            │               ├─ 沿法线双线性插值采样（20mm 起点，最多 20mm）
-            │               └─ 滑动最大值 + 绝对低信号双条件触发
-            │
-            ├─ [双模态融合 → 红色前缘线]
-            │       ├─ 上升沿 refined 点 + 下降沿 confirmed 点 → 合并点集
-            │       ├─ filter_arc_roi_by_dense_offset() 密集窗口过滤
-            │       └─ MAD + 插值 + 8mm 平滑 → 红线
-            │
-            └─ [V14 椎体链路分析] ★新增
-                    ├─ identify_vertebrae_chain() 识别完整椎体链路
-                    │       ├─ 自动判定 S1/L5 起始位置
-                    │       ├─ 命名扩展至 T12-T8（禁用 V6/V7 占位符）
-                    │       └─ 向上追踪 L4/L3/L2/L1
-                    ├─ compute_geometric_center() 计算几何中心
-                    │       └─ 四角点平均坐标 → 文字标注位置
-                    └─ apply_dorsal_smoothing() 背部线平滑增强
-                            └─ 5mm 移动均值（与皮质线 1 一致）
+NIfTI (W图 3D)
+      │
+      ▼
+[preprocessing]
+  series_utils   → 序列类型识别
+  slice_selector → 切片优选 → best_slice_idx, green_mask, canal_seed
+      │
+      ▼
+[segmentation]
+  SpinalCanalProcessor → traced(椎管掩模), v9_data{all_rows, smooth_cols}
+  皮质线1 (c1_rows, c1_cols)
+  皮质线延伸 → 皮质线2-2 (c2_rows_mode4, c2_cols_mode4)
+      │
+      ▼
+[preprocessing]
+  image_loader → 同相位图 IN/IP (in_img_2d, pixel_spacing)
+      │
+      ▼
+[detection – Mode4 流水线]
+  Step1: signal_ref       → low_mean, high_mean
+  Step2: junction_detector→ junction_pts, anchor_pts_list
+  Step2b: repair_junction → 去多/补少/末尾实扫补全
+  Step3: disc_centers     → disc_centers, vert_centers
+  Step3.5: verify_last    → 末尾两椎体汇合点校正
+  Step4: fan_scanner/disc → scan_results[sup_pts, inf_pts, ant_pts, ...]
+  Step4c: _verify_ant_pts → 前缘候选点二次校验（夹角<65°且角度过滤）
+  Step5: anterior_edge    → cluster_results[sup, inf, ant]
+      │
+      ▼
+[chain]
+  build_vertebra_chain → vertebra_chain, ant_line
+      │
+      ▼
+[output]
+  export_masks    → {stem}_seg.nii.gz + {stem}_roi.zip
+  export_csv      → {stem}_geom.csv
+  export_log      → {stem}_log.txt
+  visualize_wifs  → {stem}_vis.png
 ```
 
-### 核心模块详解 (Core Modules)
+### 核心模块详解
 
-#### 1. 预处理模块 (Preprocessing)
-- **序列筛选**: 验证 series_description 包含 t2 + dixon + W
-- **最优切片选择**: 几何硬约束过滤 + 复合评分（行数 × 形状分）
+#### 1. 预处理 (preprocessing)
 
-#### 2. 椎管分割模块 (Spinal Canal Segmentation)
-- **双区域 Otsu**: 行 5%-55% / 40%-90% 独立分割
-- **最大连通域**: 保留主体结构 + 1px 膨胀
-- **边界追踪**: 骨骼化处理后提取皮质线 1/2
-
-#### 3. V15 法线扫描线生成
-- **33 条扫描线**: 1mm 间距，1-33mm 深度覆盖
-- **法线计算**: 逐点切线 → 旋转 90° → 法向量 (nx, ny)
-- **坐标系**: 以皮质线 1 二次平滑为基准
-
-#### 4. 终板检测模块 (Endplate Detection)
-- **三区统计**: 后区/中区/前区独立 Otsu
-- **状态机**: looking_for='drop' → 'rise' 交替检测
-- **聚类**: 5mm 弧长滑动窗口 → 峰值合并
-
-#### 5. 前缘线检测模块 (Anterior Edge Detection)
-- **上升沿路径**: 谷底查找 → 脂肪过滤 → 高低高模式过滤 → 确认
-- **下降沿路径**: 20mm 起点 → 水平扫描 → 双条件触发
-- **双模态融合**: 合并两种路径 → 密集窗口过滤 → 红线输出
-
-#### 6. 椎体链路识别模块 (V14 新增) ⭐
-- **S1/L5 判定**: 基于前缘夹角（<45° → S1, ≥45° → L5）
-- **胸椎扩展**: L5 → L4 → L3 → L2 → L1 → T12 → T11 → T10 → T9 → T8
-- **几何中心**: 四角点平均坐标（top_c1 + top_front + bot_front + bot_c1）/ 4
-
-### 关键技术特点 (Key Technical Features)
-
-| 特性 | 描述 |
+| 模块 | 功能 |
 |------|------|
-| **双模态融合** | 上升沿 + 下降沿合并，增强鲁棒性 |
-| **参数自适应** | 基于像素间距/场强/并行采集动态调整 |
-| **MAD 平滑** | 鲁棒离群点过滤，避免噪声干扰 |
-| **法线扫描** | V15 沿皮质线曲度追踪，符合解剖结构 |
-| **胸椎扩展** | V14 支持 T12-T8 命名，禁用通用占位符 |
+| `series_utils.py` | 序列类型识别（W/IN/IP/F），支持西门子/联影命名 |
+| `image_loader.py` | 同相位序列（IN/IP）自动查找与加载 |
+| `slice_selector.py` | 切片优选：V14_2 三步掩模合并 + 四重形态校验 |
 
----
+**切片优选三步算法**：
 
-## 📁 项目结构 (Project Structure)
+| 步骤 | 操作 |
+|------|------|
+| Step1 | 上区域 Otsu → 核心绿色掩模（锁定椎管身份）|
+| Step2 | 下区域连通域与核心重叠判断 → 合并 |
+| Step3 | 底行不足时向下搜索，四重形态校验（宽度比/左边界自洽/CV/细长比）|
+
+#### 2. 椎管分割 (segmentation)
+
+| 模块 | 功能 |
+|------|------|
+| `canal_processor.py` | SpinalCanalProcessor：双区域 Otsu → 边界追踪 → 皮质线 1 |
+| `cortical_line.py` | 皮质线后处理：20mm 移动均值平滑 + 斜率修复 + 尾部延伸 |
+| `endplate_detector.py` | V15 终板候选点检测（状态机扫描）|
+| `endplate_clusterer.py` | 终板候选点聚类（cluster_endplates_v15）|
+| `scan_lines_v15.py` | V15 扫描线构建（沿皮质线法线方向 40 条线）|
+
+#### 3. 特征检测 (detection) — Mode4 核心流水线
+
+| 模块 | 步骤 | 功能 |
+|------|------|------|
+| `signal_ref.py` | Step1 | 同相位图信号参考值（c2 前 70% 法线偏移采样）|
+| `junction_detector.py` | Step2/2b | 终板汇合点扫描 + 修补（去多/补少/末尾 19 档实扫）|
+| `disc_centers.py` | Step3/3.5 | 椎间盘/椎体中心 + 末尾两椎体独立校验 |
+| `fan_scanner.py` | Step4/4c | disc 矩阵扫描终板 + 扇形扫描前缘 + 角度过滤 |
+| `anterior_edge.py` | Step5 | 前缘聚类 + 终板聚类 + 平滑工具 |
+| `_scan_utils.py` | 工具 | 皮质线投影 + 四函数低谷扫描（横向/对角/纵向/单像素）|
+
+#### 4. 椎体链路 (chain)
+
+| 模块 | 功能 |
+|------|------|
+| `vertebra_chain.py` | Step6：前缘拼接 + 终板延伸 + 符号变化法求交 + 四分支命名 |
+
+**椎体命名规则**：
 
 ```
-LSMATools/
-├── LSMATools.py              # 主程序文件
-├── README.md                 # 本说明文件
-├── LICENSE                   # MIT 开源许可证
-├── requirements.txt          # Python 依赖列表
-├── examples/
-│   └── basic_usage.py       # 使用示例
-└── docs/
-    ├── algorithm_design.md  # 算法设计文档（中文）
-    └── api_reference.md     # API 参考文档
+sup_angle ≥ 30°        → S 椎体
+sup_angle ∈ [10°, 30°) → 灰色区间：width_ratio ≥ 1.2 OR hw_ratio ≥ 1.2 → S
+sup_angle < 10°         → L 椎体
+
+四分支：last=S+sec=S → S2,S1,L5...
+       last=S+sec=L → S1,L5,L4...
+       last=L+sec=S → S2,S1,L5... (sec 假阳性忽略)
+       last=L+sec=L → L5,L4,L3...
 ```
 
----
+#### 5. 结果输出 (output)
 
-## ⚙️ 配置参数 (Configuration)
+| 模块 | 功能 |
+|------|------|
+| `mask_export.py` | NIfTI 多标签掩模 + Fiji ROI ZIP 导出 |
+| `csv_export.py` | CSV 几何形态导出 |
+| `log_export.py` | 单例处理日志导出 |
+| `visualization.py` | W 图 / 同相位图（IN/IP）双图可视化 PNG |
 
-### 像素间距自适应 (Pixel Spacing Adaptation)
+#### 6. 配置 (config)
 
-LSMATools 根据图像分辨率自动调整参数：
+| 模块 | 功能 |
+|------|------|
+| `params.py` | 全局参数常量 + 椎体标签映射 |
+| `metadata_parser.py` | metadata.json 解析 |
 
-| 等级 | 像素间距 | tol_mm | min_pts |
-|------|---------|--------|---------|
-| HR   | ≤0.50mm | 2.0mm  | 7       |
-| STD  | ≤0.75mm | 2.5mm  | 7       |
-| LR   | >0.75mm | 3.0mm  | 6       |
+#### 7. 通用工具 (utils)
 
-### 场强修正 (Field Strength Correction)
-
-- **3T 场强** (≥2.5T): depth_thresh × 1.10
-- **并行采集**: depth_thresh × 0.92
-
----
-
-## 🔬 技术细节 (Technical Details)
-
-### 输入要求 (Input Requirements)
-
-- **格式**: NIfTI (.nii.gz)
-- **序列**: T2 Dixon W（压脂） + F（压水）配对
-- **平面**: 矢状位 (Sagittal)
-- **推荐分辨率**: ≤0.75mm (STD 等级)
-
-### 坐标系统 (Coordinate System)
-
-- **base_col**: 皮质线 2（c2）的列坐标基准
-- **offset_mm**: `(base_col - col) × pixel_spacing`
-  - 从皮质线 2 向腹侧（椎体方向）的距离
-  - offset 增大 → col 减小 → 图像中向左移动
-
-### 关键算法参数 (Key Parameters)
-
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `left_off_mm` | 20.0mm | 谷底搜索 ROI 右边界 |
-| `right_off_mm` | 40.0mm | 谷底搜索 ROI 左边界基准 |
-| `scan_mm` | 40.0mm | 上升沿精修扫描距离 |
-| `rise_ratio` | 0.50 | 上升沿触发比例 |
-| `drop_ratio3` | 动态 [0.25-0.60] | 下降沿动态阈值 |
-| `window_mm` | 6.0mm | 密集窗口宽度 |
-| `smooth_k` | 8.0mm | 前缘线平滑窗口 |
+| 模块 | 功能 |
+|------|------|
+| `geometry.py` | 通用几何函数（点距、向量夹角、线段交点等）|
 
 ---
 
-## 🧪 测试验证 (Testing & Validation)
+## 项目结构 (Project Structure)
 
-### 核心功能验证 (Core Functionality Validation)
-
-#### 1. 腰椎链路全轮廓检测 (Vertebra Chain Detection) ⭐ V14 核心
-
-**测试场景**:
-- ✅ **S1 起始场景**: S1 → L5 → L4 → L3 → L2 → L1 → T12 → ... 
-  - 验证点：S1/L5 自动判定逻辑（基于前缘夹角 <45°）
-  - 验证点：胸椎命名扩展（T12-T8）正确性
-  - 验证点：椎体链路完整性（无中断、无跳跃）
-
-- ✅ **L5 起始场景**: L5 → L4 → L3 → L2 → L1 → T12 → ...
-  - 验证点：L5 识别准确率（夹角 ≥45°）
-  - 验证点：向上追踪连续性（L4/L3/L2/L1 依次标注）
-  - 验证点：胸椎延伸命名（T12/T11/T10...）
-
-- ✅ **大扫描范围场景**: 包含 >5 个椎体
-  - 验证点：完整覆盖 L5 → L4 → L3 → L2 → L1（5 个腰椎）
-  - 验证点：向上扩展 S1（向下）或 T12（向上）的命名正确性
-  - 验证点：超过 6 个椎体时自动生成 T11/T10/...（禁用 V6/V7 占位符）
-  - 验证点：几何中心标注位置准确性
-
-**验证指标**:
-- 椎体识别准确率 ≥ 95%
-- 椎体命名正确率 ≥ 98%
-- 椎体链路覆盖率 ≥ 90%（检测到的椎体数 / 实际可见椎体数）
-- 几何中心标注偏差 ≤ 3mm
-
----
-
-#### 2. 终板检测 (Endplate Detection)
-
-**测试场景**:
-- ✅ **典型终板**: 正常解剖结构
-- ✅ **退行性变**: Modic 改变 I/II/III 型
-- ✅ **倾斜终板**: S1 倾斜、L5 楔形变
-- ✅ **部分遮挡**: 金属伪影、术后改变
-
-**验证指标**:
-- 上终板（upper）检测敏感度 ≥ 92%
-- 下终板（lower）检测敏感度 ≥ 92%
-- 终板聚类弧长误差 ≤ 2mm
-- 解剖间距复核通过率 ≥ 85%
-
----
-
-#### 3. 前缘线检测 (Anterior Edge Detection)
-
-**测试场景**:
-- ✅ **上升沿模式**: 清晰上升沿信号
-- ✅ **下降沿模式**: 腹侧低信号皮质骨
-- ✅ **脂肪过滤**: 排除腹侧脂肪伪影
-- ✅ **双模态融合**: 红线连续性验证
-
-**验证指标**:
-- 前缘线连续性 ≥ 85%
-- 密集窗口内点密度 ≥ 8 点/cm
-- 右侧补充点距离约束 ≤ 5mm
-- 红线平滑度（MAD）≤ 1.5mm
-
----
-
-#### 4. 皮质线与背部线 (Cortical Lines & Dorsal Line)
-
-**测试场景**:
-- ✅ **皮质线 1**: 椎管前壁高信号边界
-- ✅ **皮质线 2**: 椎管后壁低信号边界
-- ✅ **背部线**: 椎管背侧边缘（V14 平滑增强）
-
-**验证指标**:
-- 皮质线 1 Dice 系数 > 0.85
-- 皮质线 2 Hausdorff 距离 ≤ 2mm
-- 背部线平滑度（5mm 移动均值）一致性 ≥ 90%
-
----
-
-### 建议测试用例 (Recommended Test Cases)
-
-| 用例编号 | 类型 | 样本量 | 关键验证点 |
-|---------|------|--------|-----------|
-| **TC-001** | 典型腰椎（S1 起始） | 20 例 | S1 识别、胸椎命名、链路完整性 |
-| **TC-002** | 典型腰椎（L5 起始） | 20 例 | L5 识别、向上追踪、几何中心 |
-| **TC-003** | 胸腰段联合扫描 | 15 例 | T12-T8 命名、大范围裁剪 |
-| **TC-004** | 退行性变（Modic） | 15 例 | 终板检测鲁棒性、前缘适应性 |
-| **TC-005** | 高分辨率（HR ≤0.50mm） | 10 例 | HR 参数路由、精细结构 |
-| **TC-006** | 标准分辨率（STD ≤0.75mm） | 20 例 | STD 参数路由、常规场景 |
-| **TC-007** | 低分辨率（LR >0.75mm） | 10 例 | LR 参数放宽、容错能力 |
-| **TC-008** | 3T 场强 | 15 例 | 场强修正（×1.10）效果 |
-| **TC-009** | 并行采集 | 10 例 | SNR 降低修正（×0.92） |
-| **TC-010** | 术后病例 | 5 例 | 金属伪影鲁棒性 |
-
-**总计**: 140 例以上，覆盖 90% 临床场景
-
----
-
-### 验证流程 (Validation Workflow)
-
-```bash
-# 1. 批量处理测试集
-python examples/basic_usage.py  # 使用批量处理示例
-
-# 2. 结果统计
-- 自动生成测量数据 CSV
-- 导出每个椎体的面积和角度
-- 统计检出率和准确率
-
-# 3. 可视化审核
-- 左图（压脂）：最终输出质量
-- 右图（压水）：调试信息完整性
-- 重点检查：椎体命名、几何中心、平滑度
-
-# 4. 金标准对比（如有手动标注）
-- 计算 Dice 系数
-- 计算 Hausdorff 距离
-- 统计角度偏差
+```
+LSMATOOLS/
+├── main.py                     # 主流程入口（单例/批量/CLI）
+├── config/
+│   ├── __init__.py
+│   ├── params.py               # 全局参数常量 / LEVEL_LABEL
+│   └── metadata_parser.py      # metadata.json 解析
+├── preprocessing/
+│   ├── __init__.py
+│   ├── series_utils.py         # 序列类型识别（W/IN/IP/F）
+│   ├── image_loader.py         # IN 序列自动查找与加载
+│   └── slice_selector.py       # 切片优选（三步掩模合并 + 四重校验）
+├── segmentation/
+│   ├── __init__.py
+│   ├── canal_processor.py      # 椎管追踪主处理器
+│   ├── cortical_line.py        # 皮质线后处理工具
+│   ├── endplate_detector.py    # 终板候选点检测（V15 状态机）
+│   ├── endplate_clusterer.py   # 终板候选点聚类
+│   └── scan_lines_v15.py       # V15 扫描线构建
+├── detection/
+│   ├── __init__.py
+│   ├── _scan_utils.py          # 皮质线投影 + 低谷扫描工具
+│   ├── signal_ref.py           # Step1 同相位图信号参考值
+│   ├── junction_detector.py    # Step2/2b 汇合点扫描+修补
+│   ├── disc_centers.py         # Step3/3.5 椎间盘中心+校验
+│   ├── fan_scanner.py          # Step4 扇形/矩阵扫描 + 4c 校验
+│   └── anterior_edge.py        # Step5 前缘聚类 + 平滑
+├── chain/
+│   ├── __init__.py
+│   └── vertebra_chain.py       # Step6 椎体链路构建 + 命名
+├── output/
+│   ├── __init__.py
+│   ├── mask_export.py          # NIfTI 掩模 + ROI ZIP 导出
+│   ├── csv_export.py           # CSV 几何导出
+│   ├── log_export.py           # 单例日志导出
+│   └── visualization.py        # W 图 / 同相位图（IN/IP）双图可视化
+├── utils/
+│   ├── __init__.py
+│   └── geometry.py             # 通用几何工具
+├── requirements.txt            # 依赖列表
+├── LICENSE                     # MIT 许可证
+└── README.md                   # 本文件
 ```
 
 ---
 
-### 性能基准 (Performance Benchmarks)
+## 配置参数 (Configuration)
 
-| 指标 | 目标值 | 实测值（典型） |
-|------|--------|---------------|
-| 单例处理时间 | < 5 秒 | 2-3 秒（Intel i7） |
-| 椎管分割 Dice | > 0.85 | 0.88-0.92 |
-| 终板检测准确率 | > 90% | 92-96% |
-| 前缘线连续性 | > 85% | 87-93% |
-| 椎体链路覆盖率 | > 90% | 92-97% |
-| 内存占用 | < 2 GB | 1.2-1.8 GB |
+### 关键参数速查
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 切片候选数 | 5（中心 ±2 张）| 候选切片范围 |
+| 椎管最小面积 | 300 mm² | 椎管连通域最小面积 |
+| 椎管宽度上限 | 30 mm | 宽度异常检测上限 |
+| 皮质线 2-2 平滑窗 | 20mm | 移动均值窗口 |
+| 信号剖面采样范围 | c2 前 70% | 排除后 30% 骶椎高信号区 |
+| Step1 信号偏移 | 20mm | 法线方向偏移距离 |
+| 终板扫描模式 | disc | 矩阵扫描终板 + 扇形扫描前缘 |
+| 前缘扇形半角 | 50° | 扇形扫描角度范围 |
+| 前缘扫描距离 | 40mm | 扇形射线扫描长度 |
+| 前缘 drop_ratio | 0.35（标准）/ 0.20（S1）| 下降沿触发阈值 |
+| 终板 drop_ratio | 0.25（上/下终板）| 终板扫描阈值 |
+| ref 锁定机制 | Step2 失败锁定 ref | 防止基准漂移 |
+| 前缘聚类 offset_min | 15mm | 排除近端伪影 |
+| 前缘聚类窗口宽 | 末尾椎体动态映射（40°→20mm，80°→5mm）| 动态窗口 |
+| 终板聚类窗口宽 | 5mm | 滑动窗口 |
+| 终板线延伸距离 | 25mm | 两端各延伸 |
+| 上终板角命名阈值 | 30° | ≥30° 为 S 椎体 |
+| 灰色区间 | 10°~30° | width_ratio ≥ 1.2 OR hw_ratio ≥ 1.2 → S |
+| 切片评分权重 | 45% + 45% + 10% | 面积 + 底部 + 空洞 |
 
 ---
 
-## 📄 许可证 (License)
+## 技术细节 (Technical Details)
+
+### 输入要求
+
+| 项目 | 要求 |
+|------|------|
+| 格式 | NIfTI (.nii.gz) |
+| 序列 | 西门子 T2 Dixon（W 水相 + IN 同相位）或 联影 T2 WFI（W 水相 + IP 同相位）|
+| 平面 | 矢状位 (Sagittal) |
+| 推荐分辨率 | ≤0.75mm |
+
+### 坐标系统
+
+| 轴 | 方向 | 说明 |
+|----|------|------|
+| row | 向下为正 | 图像行索引，0 = 图像顶部 |
+| col | 向右为正 | 图像列索引，0 = 图像左侧 |
+| 腹侧 | col 减小（向左）| 矢状位图像中椎体前方 |
+| 背侧 | col 增大（向右）| 矢状位图像中椎管侧 |
+| 头颅侧 | row 减小（向上）| superior 方向 |
+| 尾骨侧 | row 增大（向下）| inferior 方向 |
+
+**扇形角度语义**：
+```
+angle = atan2(dr, dc)
+dr = sin(angle)，dc = cos(angle)
+
+angle 增大（+方向） → dr 变负 → 射线朝头颅侧（superior）
+angle 减小（-方向） → dr 变正 → 射线朝尾骨侧（inferior）
+```
+
+### 法线方向
+
+`_project_to_c2` 返回法线方向：
+- 切线 `(t_dr, t_dc)` 顺时针旋转 90° → 法线 `(n_row, n_col) = (t_dc, -t_dr)`
+- 强制 `n_col < 0`（朝腹侧）
+
+---
+
+## 版本历史 (Version History)
+
+### V15.5（2026-03）
+
+**1. Step2 信号确认：三点均值 → 两两组合任一满足**
+
+四个 `_scan_normal_descent*` 函数的 Step2 确认逻辑从「三点均值」改为「两两组合任一满足」，可捕获单侧信号突变。
+
+**2. S1 前缘信号确认：对角配对 → 单像素直判**
+
+S1 骶椎前缘骨骼-软组织过渡区信号对比度低，单一像素更灵敏。
+
+**3. S1 前缘下降沿阈值动态适配**
+
+最后椎体满足角度校验时，前缘扫描 `drop_ratio` 从 0.35 降至 0.20。
+
+**4. 切片优选 Step3 四重形态校验**
+
+桥接候选区域校验从单一宽度比扩展为四重：宽度比 / 左边界自洽 / 宽度一致性 CV / 细长比。
+
+**5. S1 局部信号日志输出**
+
+最后两个椎体的局部 low_mean/high_mean 采样值打印到日志。
+
+---
+
+## 许可证 (License)
 
 本项目采用 **MIT 许可证** - 详见 [LICENSE](LICENSE) 文件
 
 Copyright (c) 2026 LSMATools Contributors
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 ---
 
-## 📜 学术引用与原创性声明 (Academic Citation & Originality)
+## 学术引用 (Academic Citation)
 
-### 核心算法存证 (Core Algorithm Certification)
+### 核心算法存证
 
 本项目的核心算法及设计文档已于 **2026 年 3 月 24 日** 通过至信链进行区块链存证，存证 id：`02d0906fd2124bd4acc575629b2bbdf0`。
 
 可通过"一点存"微信小程序核验存证信息。
 
-### 开源协议 (Open Source License)
-
-本项目基于 **MIT 许可证** 开源，欢迎自由使用、修改和分发。
-
-### 学术引用规范 (Academic Citation Guidelines)
-
-若在学术论文、研究报告或商业产品中使用本代码，请按学术规范注明原始来源，引用格式如下：
+### 引用格式
 
 ```
-LSMATools Contributors. LSMATools: Lumbar Spine MRI Analysis Tools V14.0, 2026.
+LSMATools Contributors. LSMATools: Lumbar Spine MRI Analysis Tools V15.5, 2026.
 GitHub repository, https://github.com/hedmx/LSMATools.
 核心算法已进行区块链存证，ID: 02d0906fd2124bd4acc575629b2bbdf0
 ```
 
-**BibTeX 格式**:
-```
+**BibTeX**:
+```bibtex
 @software{lsma_tools_2026,
   author = {LSMATools Contributors},
   title = {LSMATools: Lumbar Spine MRI Analysis Tools},
-  version = {14.0},
+  version = {15.5},
   year = {2026},
   url = {https://github.com/hedmx/LSMATools},
   note = {Core algorithm certified with blockchain ID: 02d0906fd2124bd4acc575629b2bbdf0}
 }
 ```
 
-### 重要提示 (Important Notice)
-
-本项目的核心算法及设计文档已在发表前完成原创性存证。任何未经授权的抢先发表行为，将可能构成学术不端。
-
 ---
 
-## 🧪 贡献指南 (Contributing)
+## 贡献指南 (Contributing)
 
 欢迎提交 Issue 和 Pull Request！
 
-1. Fork 本仓库
-2. 创建功能分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
-
-### 代码规范 (Code Style)
+### 代码规范
 
 - 遵循 PEP 8 规范
 - 函数添加类型提示 (Type Hints)
@@ -581,18 +545,12 @@ GitHub repository, https://github.com/hedmx/LSMATools.
 
 ---
 
-## 📧 联系方式 (Contact)
+## 联系方式 (Contact)
 
 - **问题反馈**: 请通过 GitHub Issues 提交
 - **功能建议**: 欢迎发起 Discussion 讨论
 
 ---
 
-## 🙏 致谢 (Acknowledgements)
-
-感谢所有为腰椎 MRI 分析算法研究做出贡献的研究团队！
-
----
-
-**最后更新**: 2026-03-09  
-**版本**: V14.0
+**最后更新**: 2026-05-07  
+**版本**: V15.5

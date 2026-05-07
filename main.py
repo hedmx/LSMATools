@@ -1,1004 +1,949 @@
 #!/usr/bin/env python3
 """
-主流程编排器（LSMATOOLS_CP V15）
-入口函数：
-  test_single_image(nifti_path, ...) - 处理单张图像
-  process_batch(parent_dir, output_dir) - 批量处理
-  main() - 命令行入口
+LSMATools_WIFS – 主流程入口
+
+功能：
+  process_single(nifti_path, metadata_path, output_dir, ...) - 处理单例
+  process_batch(input_dir, output_dir)                        - 批量处理
+  main()                                                      - CLI 入口
+
+流程（与 LSMATOOLS_CR mode4 完全对齐）：
+  1. 加载 W 图 NIfTI + metadata
+  2. 切片优选（椎管种子面积最大）
+  3. 椎管追踪 → 皮质线1
+  4. mode4（IN序列膜态分割）：
+     皮质线1尾部延伸 → 皮质线2-2派生
+     加载 IN 序列
+     Step1: 信号参考值
+     Step2+2b: 终板汇合点扫描 + 修补
+     Step3+3.5: 椎间盘/椎体中心 + 最后两椎体汇合点校验
+     Step4: 扇形扫描
+     Step4c: 前缘二次校验（无条件执行）
+     Step5: 聚类
+     Step6: 椎体链路
+  5. 四种输出：掩模/CSV/日志/可视化
 """
+
 import os
-import sys
 import io
+import sys
 import json
-import numpy as np
-import nibabel as nib
+import math
 import warnings
+from datetime import datetime
 warnings.filterwarnings('ignore')
 
+import numpy as np
+import nibabel as nib
+from pathlib import Path
+
+# ── 内部模块导入 ──
 from config.metadata_parser import load_metadata, parse_pixel_spacing
-from preprocessing.series_utils import _get_series_type
-from preprocessing.image_loader import find_fat_water_image
+from config.params import SMOOTH_MM_C2, OFFSET_MM_SIGNAL
+from preprocessing.series_utils import _get_series_type, _is_dixon_sequence
 from preprocessing.slice_selector import select_best_slice
-from preprocessing.coordinate_align import align_scan_lines_to_f
-from segmentation.canal_processor import SpinalCanalProcessor, SpinalCordLocator
-from segmentation.clustering import cluster_endplates_v15
-from segmentation.endplate_detector import find_endplates_on_water_image
-from segmentation.anterior_edge import (
-    scan_anterior_edge_v15, find_anterior_edge_by_descent,
-    filter_arc_roi_by_dense_offset, refine_arc_roi_to_anterior_edge,
-    find_anterior_corner_v15, find_arc_roi_min_points,
+from preprocessing.image_loader import find_in_image
+from segmentation.canal_processor import SpinalCanalProcessor
+from segmentation.endplate_clusterer import cluster_endplates_v15
+from detection.signal_ref import compute_signal_references
+from detection.junction_detector import scan_endplate_junction_points, repair_junction_pts
+from detection.disc_centers import compute_disc_and_vertebra_centers, verify_last_junction_point
+from detection.fan_scanner import (
+    fan_scan_vertebra, _sample_ant_local_signal, _calc_ant_angle_deg,
+    _verify_ant_pts_forward, scan_disc_endplates,
+    _fan_scan_direction, _scan_normal_descent_ant, _scan_normal_descent_ant_diag,
 )
-from postprocessing.geometric_center import compute_vertebra_geometry
-from postprocessing.visualization import visualize_results
-from postprocessing.export import export_vertebra_data
+from detection.anterior_edge import cluster_all_vertebrae
+from chain.vertebra_chain import build_vertebra_chain
+from output.mask_export import export_masks
+from output.csv_export import export_csv
+from output.log_export import export_log
+from output.visualization import visualize_wifs
 
 
-def test_single_image(nifti_path, metadata_path=None, output_dir=None, 
-                     patient_dir=None, seq_dir=None):
-    """测试单张图像"""
-    
-    import io
-    import sys
-    
-    # 捕获日志输出
+# ─────────────────────────────────────────────────────────────────────────────
+# 皮质线工具（mode4 内部辅助）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extend_line_tail(rows, cols, pixel_spacing,
+                      extend_mm=5.0, ref_mm=5.0):
+    """取皮质线尾部做 polyfit，沿斜率延伸 extend_mm 路径距离。"""
+    rows = list(rows); cols = list(cols)
+    if len(rows) < 2:
+        return rows, cols
+    paired = sorted(zip(rows, cols), key=lambda p: p[0])
+    rs = np.array([p[0] for p in paired], dtype=np.float64)
+    cs = np.array([p[1] for p in paired], dtype=np.float64)
+
+    cum_dist = np.zeros(len(rs))
+    for k in range(1, len(rs)):
+        cum_dist[k] = cum_dist[k-1] + math.sqrt(
+            (rs[k]-rs[k-1])**2 + (cs[k]-cs[k-1])**2)
+    total_dist = cum_dist[-1]
+
+    ref_px = ref_mm / pixel_spacing
+    mask = cum_dist >= (total_dist - ref_px)
+    seg_r = rs[mask]; seg_c = cs[mask]
+    if len(seg_r) < 2:
+        seg_r = rs[-2:]; seg_c = cs[-2:]
+    try:
+        slp, _ = np.polyfit(seg_r, seg_c, 1)
+    except Exception:
+        slp = float(seg_c[-1] - seg_c[0]) / max(float(seg_r[-1] - seg_r[0]), 1e-9)
+
+    t_len = math.sqrt(1.0 + slp**2)
+    d_row = 1.0 / t_len
+    d_col = slp / t_len
+
+    ext_px = extend_mm / pixel_spacing
+    cur_r = float(rs[-1]); cur_c = float(cs[-1])
+    acc = 0.0
+    ext_rows = []; ext_cols = []
+    while acc < ext_px:
+        cur_r += d_row; cur_c += d_col
+        acc += math.sqrt(d_row**2 + d_col**2)
+        ext_rows.append(cur_r); ext_cols.append(cur_c)
+
+    return list(rs) + ext_rows, list(cs) + ext_cols
+
+
+def _repair_slope(cols, slope_thr=0.5, neighbor_px=10, max_iter=3):
+    """皮质线斜率连续性修复。"""
+    cols = cols.astype(np.float64).copy()
+    for _ in range(max_iter):
+        slopes = np.diff(cols)
+        bad = np.zeros(len(cols), dtype=bool)
+        for i in range(len(slopes)):
+            i0 = max(0, i - neighbor_px)
+            i1 = min(len(slopes), i + neighbor_px + 1)
+            local_med = float(np.median(slopes[i0:i1]))
+            if abs(slopes[i] - local_med) > slope_thr:
+                bad[i] = True; bad[i + 1] = True
+        if not bad.any():
+            break
+        good_idx = np.where(~bad)[0]
+        if len(good_idx) < 2:
+            break
+        for gi in range(len(good_idx) - 1):
+            s = good_idx[gi]; e = good_idx[gi + 1]
+            if e - s > 1:
+                cols[s:e+1] = np.linspace(cols[s], cols[e], e - s + 1)
+    return cols.astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# process_single：单例处理主流程
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_single(nifti_path, metadata_path=None, output_dir=None,
+                   patient_dir=None, seq_dir=None, fast_mode=False):
+    """
+    处理单例 W 图，输出掩模/CSV/日志/可视化。
+
+    参数：
+        nifti_path    - 压脂图 scan.nii.gz 路径
+        metadata_path - metadata.json 路径（可为 None）
+        output_dir    - 输出目录（默认 ./wifs_output）
+        patient_dir   - 患者目录（可为 None，用于日志）
+        seq_dir       - 序列目录（可为 None）
+        fast_mode     - True：快速轻量模式（仅掩膜+CSV+左图可视化，不输出ROI和单例日志）
+
+    返回：
+        {'status': 'success'|'failed', 'n_vertebrae': int, ...}
+    """
+    # ── 捕获日志 ──
     log_capture = io.StringIO()
     original_stdout = sys.stdout
     sys.stdout = log_capture
-    
-    print("="*80)
-    print("单张图像测试 - 滑动窗口法")
-    print("="*80)
-    
+
+    try:
+        result = _run_single(
+            nifti_path, metadata_path, output_dir,
+            patient_dir, seq_dir, fast_mode=fast_mode)
+    except Exception as exc:
+        import traceback
+        print(f"\n[FATAL] 处理异常: {exc}")
+        traceback.print_exc()
+        result = {'status': 'failed', 'error': str(exc), 'n_vertebrae': 0}
+    finally:
+        sys.stdout = original_stdout
+
+    log_content = log_capture.getvalue()
+    # 所有模式均保存完整日志到文件（失败案例必须可追溯）
+    if output_dir and result.get('stem'):
+        try:
+            export_log(log_content, output_dir, result['stem'])
+        except Exception:
+            pass
+
+    # 终端仅输出保存记录和错误信息（其余分割日志只在文件中）
+    _filtered_lines = []
+    for _line in log_content.split('\n'):
+        _s = _line.strip()
+        if any(_s.startswith(f'[{t}]') for t in ['mask', 'roi', 'csv', 'log', 'vis']):
+            _filtered_lines.append(_line)
+        elif '[FATAL]' in _s or '❌' in _s:
+            _filtered_lines.append(_line)
+    if _filtered_lines:
+        print('\n'.join(_filtered_lines))
+    return result
+
+
+def _run_single(nifti_path, metadata_path, output_dir,
+                patient_dir, seq_dir, fast_mode=False):
+    """实际的单例处理逻辑（由 process_single 包装）。"""
     if output_dir is None:
-        output_dir = os.path.join(os.getcwd(), "test_output")
+        output_dir = os.path.join(os.getcwd(), 'wifs_output')
     os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"\n📂 加载图像: {nifti_path}")
+
+    print("=" * 70)
+    print("LSMATools_WIFS – 单例处理")
+    print("=" * 70)
+    print(f"\n📂 图像: {nifti_path}")
+
+    # ── 构建输出文件名前缀 ──
+    nii_path_obj = Path(nifti_path)
+    seq_dir_name = nii_path_obj.parent.name
+    patient_name = nii_path_obj.parent.parent.name
+    stem = f"{patient_name}_{seq_dir_name}"
+
+    # ── 加载图像 ──
     try:
         img = nib.load(nifti_path)
     except Exception as e:
         print(f"❌ 无法加载图像: {e}")
-        return
-    
-    data = img.get_fdata()
-    n_slices = data.shape[2]
-    
-    # 初始化变量（用于 JSON 输出）
-    best_slice_idx = None
-    merged_regions = None
-    status = None
-    pixel_spacing_val = 0.9375
-    
+        return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
+
+    data       = img.get_fdata()
+    orig_affine = img.affine
+
+    # ── 读取 metadata ──
     pixel_spacing = 0.9375
     meta = {}
     if metadata_path and os.path.exists(metadata_path):
-        import json
         try:
-            with open(metadata_path, 'r') as f:
-                meta = json.load(f)
-                acq  = meta.get('acquisition_params', {})
-                si   = meta.get('series_info', {})
-                spacing = acq.get('pixel_spacing_mm', [0.9375, 0.9375])
-                pixel_spacing = float(spacing[0]) if isinstance(spacing, list) else float(spacing)
-                pixel_spacing_val = pixel_spacing  # 保存用于 JSON
-            print(f"   📋 像素间距: {pixel_spacing:.4f}mm")
-            # 校验输入序列必须是 T2 Dixon W 序列
+            meta = load_metadata(metadata_path)
+            pixel_spacing = parse_pixel_spacing(meta)
+            si = meta.get('series_info', {})
             w_desc = si.get('series_description', '')
-            w_type = _get_series_type(w_desc)
             if w_desc:
-                is_t2     = 't2'    in w_desc.lower()
-                is_dixon  = 'dixon' in w_desc.lower()
-                is_w_type = w_type == 'W'
-                if not (is_t2 and is_dixon and is_w_type):
-                    print(f"   ⚠️ 序列校验: series='{w_desc}'")
-                    if not is_t2:
-                        print("      ❌ 不是T2序列")
-                    if not is_dixon:
-                        print("      ❌ 不是Dixon序列")
-                    if not is_w_type:
-                        print(f"      ❌ 序列类型为'{w_type}'，不是W(压脂)序列")
-                    print("   ⚠️ 继续处理，但结果可能不可靠")
-                else:
+                is_t2    = 't2' in w_desc.lower()
+                is_dixon = _is_dixon_sequence(w_desc)
+                is_w     = _get_series_type(w_desc) == 'W'
+                if is_t2 and is_dixon and is_w:
                     print(f"   ✅ 序列校验通过: T2 Dixon W | '{w_desc}'")
-        except:
-            print(f"   ⚠️ 使用默认像素间距: {pixel_spacing:.4f}mm")
+                else:
+                    print(f"   ⚠️ 序列校验: '{w_desc}' (t2={is_t2}, dixon={is_dixon}, W={is_w})")
+        except Exception as e:
+            print(f"   ⚠️ metadata 读取异常: {e}，使用默认 pixel_spacing={pixel_spacing}")
+    print(f"   像素间距: {pixel_spacing:.4f} mm")
 
-    # ── 切片优选：先读 meta 获得真实 pixel_spacing，再取 mid±2 中椎管种子面积最大切片 ──
-    best_slice_idx, best_green_mask, _, merged_regions, best_canal_seed = select_best_slice(data, pixel_spacing=pixel_spacing)
+    # ── 切片优选 ──
+    print("\n── 切片优选 ──")
+    best_slice_idx, best_green_mask, _, merged_regions, best_canal_seed, csf_hints = \
+        select_best_slice(data, pixel_spacing=pixel_spacing)
     slice_2d = data[:, :, best_slice_idx].astype(np.float32)
-    print(f"   📍 压脂图使用切片索引={best_slice_idx+1} / {data.shape[2]}")
+    print(f"   最佳切片第{best_slice_idx+1}张 / 共{data.shape[2]}张")
 
-    print("\n🔍 正在处理椎管...")
+    # ── 椎管追踪 ──
+    print("\n── 椎管追踪 ──")
     processor = SpinalCanalProcessor(pixel_spacing, meta=meta)
-    
-    # 如果最佳切片的完整种子掩模有效，用它作为追踪种子
     if best_canal_seed is not None and np.any(best_canal_seed):
-        print(f"   ✅ 使用最佳切片的绿色掩模（合并后）进行后续处理")
         traced, roi_points, valid_rows, status, v9_data = processor.process_with_mask(
             slice_2d, best_green_mask, best_canal_seed,
-            merged_regions=merged_regions
-        )
+            merged_regions=merged_regions, csf_hints=csf_hints)
     else:
-        # 回退到正常流程
         traced, roi_points, valid_rows, status, v9_data = processor.process(slice_2d)
-    
+
     if traced is None:
         print(f"   ❌ 椎管处理失败: {status}")
-        return
-    
-    print(f"   ✅ {status}")
-    if roi_points and roi_points.get('csf'):
-        print(f"   📊 找到 {len(roi_points['csf'])} 个脑脊液中心点")
-    
-    # 定位骨髓
-    print("\n🔍 正在定位骨髓...")
-    locator = SpinalCordLocator(pixel_spacing)
-    success, cord_mask, roi_points = locator.locate(slice_2d, traced, roi_points)
-    
-    if success:
-        print(f"   ✅ 骨髓定位成功")
-    else:
-        print(f"   ⚠️ 骨髓定位失败，只显示椎管")
-    
-    # 生成输出文件名
-    if patient_dir and seq_dir:
-        output_filename = f"{patient_dir}_{seq_dir}_TRACED.png"
-    else:
-        base_name = os.path.splitext(os.path.basename(nifti_path))[0]
-        if base_name.endswith('.nii'):
-            base_name = base_name[:-4]
-        output_filename = f"{base_name}_TRACED.png"
-    
-    output_path = os.path.join(output_dir, output_filename)
+        return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
+    print(f"   ✅ 椎管追踪完成: {status}")
 
-    # ===== V12：加载压水图 + 坐标对齐 + 终板检测 =====
-    f_img_2d = None
-    f_meta   = {}
-    f_data   = None
-    if v9_data and v9_data.get('scan_lines'):
-        f_img_2d, f_meta, f_nii_path = find_fat_water_image(nifti_path, slice_idx=best_slice_idx)
-        if f_img_2d is not None:
-            scan_lines_f = align_scan_lines_to_f(
-                v9_data['scan_lines'], meta, f_meta, f_img_2d)
-            v9_data['scan_lines_f'] = scan_lines_f
-    
-            # ── V13 切线方向扫描线 → 弧长坐标系聚类 → 终板线 ──
-            _c2_cols       = v9_data.get('c2_cols')
-            _c2_rows       = v9_data.get('c2_rows')
-            _arc_len_mm_v  = v9_data.get('arc_len_mm')
-            _scan_lines_v15= v9_data.get('scan_lines_v15', [])
-            if (_c2_cols is not None and _c2_rows is not None
-                    and _arc_len_mm_v is not None and _scan_lines_v15):
-                # 用全部 40 条扫描线在压水图上计算 high_mean/low_mean 及终板候选点
-                print("\n🔍 V15 扫描线终板检测（全部 40 条，用于 high_mean/low_mean 及候选点）")
-                f_data_v15 = find_endplates_on_water_image(
-                    [(off_mm, cols_a, rows_a) for off_mm, rows_a, cols_a, nx_a, ny_a in _scan_lines_v15],
-                    f_img_2d, pixel_spacing)
-                raw_cands_v15 = f_data_v15.get('raw_candidates', []) if f_data_v15 else []
-                print(f"   [V15] V15扫描线候选点: {len(raw_cands_v15)} 个")
-                if f_data_v15:
-                    _hm1 = f_data_v15.get('high_mean1', 0); _lm1 = f_data_v15.get('low_mean1', 0)
-                    _hm2 = f_data_v15.get('high_mean2', 0); _lm2 = f_data_v15.get('low_mean2', 0)
-                    _hm3 = f_data_v15.get('high_mean3', 0); _lm3 = f_data_v15.get('low_mean3', 0)
-                    print(f"   [三区信号] 后区: high={_hm1:.0f} low={_lm1:.0f} | "
-                          f"中区: high={_hm2:.0f} low={_lm2:.0f} | "
-                          f"前区: high={_hm3:.0f} low={_lm3:.0f}")
-                # 弧长坐标系初始聚类
-                consensus_v15 = cluster_endplates_v15(
-                    raw_cands_v15, _scan_lines_v15,
-                    _c2_cols, _c2_rows, _arc_len_mm_v,
-                    pixel_spacing, win_mm=5.0, min_lines=15)
-                print(f"   [V15聚类] 初始终板线：{len(consensus_v15)} 条")
-                
-                # ── 全局回退策略：上下终板线只要有一个 < 5 条，就用 global_med × 0.5 重扫整个流程 ──
-                _v15_scan_input = [(sl[0], sl[2], sl[1]) for sl in _scan_lines_v15]
-                _min_ep_count  = 5  # 上下终板线最少各需 5 条
-                _retry_added_keys = set()   # {(type_flag, line_idx), ...}
-                
-                # 统计上下终板线数量
-                _sup_lines = [ep for ep in consensus_v15 if ep.get('ep_type') == 'superior']
-                _inf_lines = [ep for ep in consensus_v15 if ep.get('ep_type') == 'inferior']
-                _sup_count = len(_sup_lines)
-                _inf_count = len(_inf_lines)
-                print(f"   [V15] 上终板线：{_sup_count} 条，下终板线：{_inf_count} 条")
-                
-                # 检查是否需要全局回退
-                if _sup_count < _min_ep_count or _inf_count < _min_ep_count:
-                    print(f"   [V15 全局回退] 触发条件：上={_sup_count} 下={_inf_count} (< {_min_ep_count})")
-                    # 重新扫描全 40 条线，同时降低 global_med、drop/rise 阈值 和 min_lines
-                    _base_drop = f_data_v15.get('drop_ratio') if f_data_v15 else drop_ratio2
-                    _base_rise = f_data_v15.get('rise_ratio') if f_data_v15 else rise_ratio2
-                    _global_drop = _base_drop * 0.7  # 降低 30%
-                    _global_rise = _base_rise * 0.7  # 降低 30%
-                    _global_min_lines = max(10, int(15 * 0.7))  # 降低 30%，但不低于 10
-                    print(f"   [V15 全局回退] 阈值调整：drop={_global_drop:.3f}, rise={_global_rise:.3f}, min_lines={_global_min_lines}")
-                    _global_retry_data = find_endplates_on_water_image(
-                        _v15_scan_input, f_img_2d, pixel_spacing,
-                        use_half_global_med=True,
-                        drop_ratio_override=_global_drop,
-                        rise_ratio_override=_global_rise)
-                    _new_c = _global_retry_data.get('raw_candidates', []) if _global_retry_data else []
-                    # 去重合并
-                    _exist_keys = {(p[0], p[4]) for p in raw_cands_v15}
-                    _added_cnt  = 0
-                    for _nc in _new_c:
-                        _k = (_nc[0], _nc[4])
-                        if _k not in _exist_keys:
-                            raw_cands_v15.append(_nc)
-                            _exist_keys.add(_k)
-                            _retry_added_keys.add(_k)
-                            _added_cnt += 1
-                    print(f"   [V15全局回退] 新增 {_added_cnt} 个候选点")
-                    if _added_cnt > 0:
-                        # 重新聚类（使用降低后的 min_lines）
-                        consensus_v15 = cluster_endplates_v15(
-                            raw_cands_v15, _scan_lines_v15,
-                            _c2_cols, _c2_rows, _arc_len_mm_v,
-                            pixel_spacing, win_mm=5.0, min_lines=_global_min_lines)
-                        # 交替校验：过滤掉连续同类型的终板线，保留行号更小的（更靠头侧）
-                        _valid_eps = []
-                        for ep in sorted(consensus_v15, key=lambda x: x['row_center']):
-                            if not _valid_eps or _valid_eps[-1]['ep_type'] != ep['ep_type']:
-                                _valid_eps.append(ep)
-                            else:
-                                print(f"   [V15 交替校验] 丢弃同类型 ({ep['ep_type']}) row={ep['row_center']:.1f}，保留头侧 row={_valid_eps[-1]['row_center']:.1f}")
-                        consensus_v15 = _valid_eps
-                        _sup_lines = [ep for ep in consensus_v15 if ep.get('ep_type') == 'superior']
-                        _inf_lines = [ep for ep in consensus_v15 if ep.get('ep_type') == 'inferior']
-                        print(f"   [V15 全局回退后] 上终板线：{len(_sup_lines)} 条，下终板线：{len(_inf_lines)} 条")
-                else:
-                    print(f"   [V15] 上下终板线数量满足要求，无需全局回退")
-                
-                # ── 回退校验策略：点数<28的终板线降低阈值重扫，最多2轮 ──
-                _base_drop     = f_data_v15.get('drop_ratio') if f_data_v15 else None
-                _base_rise     = f_data_v15.get('rise_ratio') if f_data_v15 else None
-                _retry_factors = [0.80, 0.65]
-                _min_pts_ep_base = 28  # 原始点数标准（min_lines=15时）
-                # 如果已经执行过全局回退，则按 min_lines 比例调整点数标准；否则使用默认值 28
-                if '_global_min_lines' in locals():
-                    # min_lines 从 15 降到 10，比例 = 10/15 = 0.67，点数标准也同步降低
-                    _pts_ratio = _global_min_lines / 15.0
-                    _min_pts_ep = int(_min_pts_ep_base * _pts_ratio)  # 28 * 0.67 ≈ 19
-                    print(f"   [V15 点数校验] 全局回退后点数标准调整：{_min_pts_ep_base} → {_min_pts_ep} (min_lines={_global_min_lines})")
-                else:
-                    _min_pts_ep = _min_pts_ep_base
-                # 记录回退新增的候选点 key 集合，供可视化区分
-                _retry_added_keys_pt = set()   # {(type_flag, line_idx), ...} 点数校验回退新增
-                # 如果已经执行过全局回退，则继承其 min_lines；否则使用默认值 15
-                _current_min_lines = _global_min_lines if '_global_min_lines' in locals() else 15
-                
-                for _retry_round, _factor in enumerate(_retry_factors, 1):
-                    _weak_eps = [ep for ep in consensus_v15
-                                 if len(ep.get('points', [])) < _min_pts_ep]
-                    if not _weak_eps:
-                        print(f"   [V15 回退] 第{_retry_round}轮：所有终板线点数已满足，停止回退")
-                        break
-                    print(f"   [V15 回退] 第{_retry_round}轮：{len(_weak_eps)}条点数<{_min_pts_ep}，"
-                          f"阈值因子×{_factor}")
-                    _rd = (_base_drop * _factor) if _base_drop else (0.25 * _factor)
-                    _rr = (_base_rise * _factor) if _base_rise else (_rd * 0.9)
-                    print(f"   [V15 回退] drop_ratio={_rd:.3f}, rise_ratio={_rr:.3f}")
-                    # 对全部扫描线用降低后的阈值重扫，合并新找到的候选点（去重）
-                    _retry_data = find_endplates_on_water_image(
-                        _v15_scan_input, f_img_2d, pixel_spacing,
-                        drop_ratio_override=_rd, rise_ratio_override=_rr)
-                    _new_c = _retry_data.get('raw_candidates', []) if _retry_data else []
-                    # 去重合并：以 (ep_type_flag, line_idx) 为 key
-                    _exist_keys = {(p[0], p[4]) for p in raw_cands_v15}
-                    _added_cnt  = 0
-                    for _nc in _new_c:
-                        _k = (_nc[0], _nc[4])
-                        if _k not in _exist_keys:
-                            raw_cands_v15.append(_nc)
-                            _exist_keys.add(_k)
-                            _retry_added_keys_pt.add(_k)   # 标记为点数校验回退新增
-                            _added_cnt += 1
-                    print(f"   [V15 点数回退] 第{_retry_round}轮：新增 {_added_cnt} 个候选点")
-                    if _added_cnt == 0:
-                        print(f"   [V15 点数回退] 第{_retry_round}轮：无新增候选点，跳过重聚类")
-                        continue
-                    consensus_v15 = cluster_endplates_v15(
-                        raw_cands_v15, _scan_lines_v15,
-                        _c2_cols, _c2_rows, _arc_len_mm_v,
-                        pixel_spacing, win_mm=5.0, min_lines=_current_min_lines)
-                    # 交替校验：过滤掉连续同类型的终板线，保留行号更小的（更靠头侧）
-                    _valid_eps = []
-                    for ep in sorted(consensus_v15, key=lambda x: x['row_center']):
-                        if not _valid_eps or _valid_eps[-1]['ep_type'] != ep['ep_type']:
-                            _valid_eps.append(ep)
-                        else:
-                            print(f"   [V15 交替校验] 丢弃同类型 ({ep['ep_type']}) row={ep['row_center']:.1f}，保留头侧 row={_valid_eps[-1]['row_center']:.1f}")
-                    consensus_v15 = _valid_eps
-                    print(f"   [V15 点数回退] 第{_retry_round}轮聚类后：{len(consensus_v15)} 条，"
-                          f"点数满足 (>={_min_pts_ep}): "
-                          f"{sum(1 for ep in consensus_v15 if len(ep.get('points',[]))>=_min_pts_ep)} 条")
-                
-                v9_data['raw_candidates_v15']      = raw_cands_v15
-                v9_data['consensus_endplates_v15']  = consensus_v15
-                # 合并全局回退 + 点数校验回退的 key 集合
-                _all_retry_keys = _retry_added_keys.union(_retry_added_keys_pt)
-                v9_data['retry_added_keys_v15']     = _all_retry_keys  # 全局回退 + 点数校验回退新增点 key 集合
-                print(f"   [V15聚类最终] 终板线：{len(consensus_v15)} 条")
-                _ant_high_mean = f_data_v15.get('high_mean3') if f_data_v15 else None
-                _ant_low_mean  = f_data_v15.get('low_mean3')  if f_data_v15 else None
-                # ── 完全对标V12_4逻辑，以皮质线2(c2_cols/c2_rows)为基准 ──
-                # Step1: 水平offset谷底查找（皮质线2做base_col）
-                arc_min_pts_v13 = find_arc_roi_min_points(
-                    f_img_2d      = f_img_2d,
-                    smooth_cols   = _c2_cols,
-                    all_rows      = _c2_rows,
-                    pixel_spacing = pixel_spacing,
-                    left_off_mm   = 20.0,
-                    right_off_mm  = 40.0,
-                    expand_ratio  = 1.5,
-                )
-                # Step2: 第一轮上升沿精修（水平向右扫回骨髓，与V12_4完全一致）
-                arc_refined1_v13 = refine_arc_roi_to_anterior_edge(
-                    arc_min_pts_v13, f_img_2d, pixel_spacing,
-                    high_mean   = _ant_high_mean if _ant_high_mean else 200.0,
-                    low_mean    = _ant_low_mean  if _ant_low_mean  else 50.0,
-                    rise_ratio  = 0.50,
-                    probe_ratio = 0.6,
-                    scan_mm     = 40.0,
-                    smooth_win  = 2,
-                )
-                # Step3.6: 定义密集空间扩展参数（算法端与可视化端共用）
-                _dense_expand_v13 = 3.0
-                if v9_data is not None:
-                    v9_data['dense_expand_v13'] = _dense_expand_v13
+    # 从 v9_data 取皮质线1/2
+    c1_rows = v9_data.get('all_rows')
+    c1_cols = v9_data.get('smooth_cols')
 
-                # Step3.6: filter（第一次密集窗口：纯上升沿）
-                arc_filtered_v13, arc_best_range_v13 = filter_arc_roi_by_dense_offset(
-                    list(arc_refined1_v13), pixel_spacing, window_mm=6.0, step_mm=0.5,
-                    expand_ratio=_dense_expand_v13)
-                # 保存第一次密集窗口位置与过滤结果供可视化对比用
-                arc_best_range1_v13  = arc_best_range_v13
-                arc_filtered1_v13    = list(arc_filtered_v13)  # 第一次密集窗口输出点，供第二次聚类输入
+    if c1_rows is None or c1_cols is None:
+        print("   ❌ 皮质线1坐标缺失，跳过 mode4")
+        return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
 
-                # Step4：平滑（与青线完全一致：MAD过滤+插値+5mm移动均値）
-                # 数据源：arc_refined1_v13（未经平滑的原始精修点）中 offset 在密集窗口内的子集
-                # 再加密集窗口右侧补充点（offset < best_lo，顶部50mm内）
-                _best_lo_mm = arc_best_range_v13[0] if arc_best_range_v13 else 0.0
-                _best_hi_mm = arc_best_range_v13[1] if arc_best_range_v13 else 999.0
-                
-                # 密集窗口内的原始精修点
-                # 与可视化虚线框完全一致：expand=3.0，行号范围用皮质线2（_c2r）全范围
-                _window_mm      = _best_hi_mm - _best_lo_mm
-                _expand_ratio_s = v9_data.get('dense_expand_v13', 3.0) if v9_data else 3.0
-                _c2r_vis = v9_data.get('c2_rows') if v9_data else None
-                if _c2r_vis is not None and len(_c2r_vis) > 0:
-                    _row_min_s  = float(min(_c2r_vis))
-                    _row_max_s  = float(max(_c2r_vis))
-                else:
-                    _ref2_rows_input = [float(p[0]) for p in arc_refined1_v13]
-                    _row_min_s = min(_ref2_rows_input) if _ref2_rows_input else 0.0
-                    _row_max_s = max(_ref2_rows_input) if _ref2_rows_input else 0.0
-                _row_span_s = max(_row_max_s - _row_min_s, 1.0)
-                _ref2_v13 = []
-                for _ps in arc_refined1_v13:
-                    if (len(_ps) > 4 and _ps[4] == 'kept_low'):
-                        continue
-                    _t_s    = (float(_ps[0]) - _row_min_s) / _row_span_s
-                    _hi_row_s = _best_lo_mm + _window_mm * (1.0 + (_expand_ratio_s - 1.0) * _t_s)
-                    _off_s  = (float(_ps[3]) - float(_ps[1])) * pixel_spacing
-                    if _best_lo_mm - 1e-6 <= _off_s <= _hi_row_s + 1e-6:
-                        _ref2_v13.append(_ps)
-                _ref2_v13 = sorted(_ref2_v13, key=lambda p: p[0])
-                
-                # 密集窗口右侧补充点（offset < best_lo，皮质线2总高度一半范围内）
-                _filtered_rows = {int(p[0]) for p in _ref2_v13}
-                _added_right = 0
-                if arc_best_range_v13 is not None and _ref2_v13:
-                    _top_row   = min(int(p[0]) for p in _ref2_v13)
-                    # 用皮质线2总高度的一半作为限制（替代固定50mm）
-                    if _c2r_vis is not None and len(_c2r_vis) > 0:
-                        _c2_half_rows = (float(max(_c2r_vis)) - float(min(_c2r_vis))) / 2.0
-                    else:
-                        _c2_half_rows = 50.0 / pixel_spacing
-                    _row_limit = _top_row + int(round(_c2_half_rows))
-                    for _rp in arc_refined1_v13:
-                        _rp_flag = _rp[4] if len(_rp) > 4 else 'kept'
-                        if _rp_flag == 'kept_low':
-                            continue
-                        _rp_off = (float(_rp[3]) - float(_rp[1])) * pixel_spacing
-                        _rp_row = int(_rp[0])
-                        if (_rp_off < _best_lo_mm
-                                and _rp_row not in _filtered_rows
-                                and _rp_row <= _row_limit):
-                            _ref2_v13.append(_rp)
-                            _filtered_rows.add(_rp_row)
-                            _added_right += 1
-                    if _added_right > 0:
-                        _ref2_v13 = sorted(_ref2_v13, key=lambda p: p[0])
-                        print(f"   [V13前缘] 右侧补充点数: {_added_right}（限制在皮质线2总高度一半以内）")
-                
-                # 全局平滑：MAD过滤 → 插値 → 5mm移动均値（与青线完全一致）
-                arc_final_v13 = []
-                if _ref2_v13 and len(_ref2_v13) >= 2:
-                    _rr2 = np.array([p[0] for p in _ref2_v13], dtype=np.float32)
-                    _cc2 = np.array([p[1] for p in _ref2_v13], dtype=np.float32)
-                    _mw2 = min(11, len(_cc2))
-                    if _mw2 % 2 == 0: _mw2 -= 1
-                    _mw2 = max(1, _mw2)
-                    _vm2 = np.ones(len(_cc2), dtype=bool)
-                    _hm2 = _mw2 // 2
-                    for _i2 in range(len(_cc2)):
-                        _s2 = max(0, _i2 - _hm2); _e2 = min(len(_cc2), _i2 + _hm2 + 1)
-                        _w2 = _cc2[_s2:_e2]
-                        _med2 = np.median(_w2); _mad2 = np.median(np.abs(_w2 - _med2))
-                        if _mad2 > 0 and np.abs(_cc2[_i2] - _med2) / (_mad2 * 1.4826) > 2.0:
-                            _vm2[_i2] = False
-                    _cr2 = _cc2[_vm2]; _rrr2 = _rr2[_vm2]
-                    if len(_rrr2) < 4: _cr2, _rrr2 = _cc2, _rr2
-                    _ari2 = np.arange(int(_rrr2[0]), int(_rrr2[-1]) + 1)
-                    _ic2  = np.interp(_ari2, _rrr2, _cr2)
-                    _k2   = max(3, int(round(8.0 / pixel_spacing)))
-                    if _k2 % 2 == 0: _k2 += 1
-                    _csm2 = np.convolve(np.pad(_ic2, _k2 // 2, mode='edge'),
-                                        np.ones(_k2) / _k2, mode='valid')
-                    _rm2  = {int(r): float(c) for r, c in zip(_ari2, _csm2)}
-                    # 输出：只输出_ref2_v13中的点（用平滑坐标）
-                    for p in _ref2_v13:
-                        arc_final_v13.append((p[0],
-                                              _rm2.get(int(p[0]), float(p[1])),
-                                              p[2], p[3],
-                                              p[4] if len(p) > 4 else 'kept'))
-                if not arc_final_v13:
-                    arc_final_v13 = arc_filtered_v13
+    # ── 椎管掩模（canal_processor 返回的 traced 即椎管布尔掩模）──
+    cord_mask_cut = traced
 
-                # ── 头尾外推补充：将 arc_final_v13 延伸到 c2_rows 完整范围 ──
-                # 目标：保证前缘线覆盖皮质线2全行（含延伸段），支持末端倾斜椎体闭合
-                _c2r_ext = _c2_rows   # 直接用已取局部变量，包含延伸段
-                _c2c_ext = _c2_cols
-                if (_c2r_ext is not None and _c2c_ext is not None
-                        and len(arc_final_v13) >= 4):
-                    _af_sorted = sorted(arc_final_v13, key=lambda p: p[0])
-                    _af_rows   = np.array([float(p[0]) for p in _af_sorted])
-                    _af_cols   = np.array([float(p[1]) for p in _af_sorted])
-                    _tgt_r0    = int(_c2r_ext[0])
-                    _tgt_r1    = int(_c2r_ext[-1])
-                    _ext_tail_px = max(4, int(round(10.0 / pixel_spacing)))  # 10mm参考段
-                    _img_W       = f_img_2d.shape[1]
+    # ── Mode4 开始 ──
+    print("\n" + "=" * 60)
+    print("Mode4: IN序列膜态分割")
+    print("=" * 60)
 
-                    # ── 头部外推（向上）──
-                    _cur_r0 = int(_af_rows[0])
-                    if _cur_r0 > _tgt_r0:
-                        _n = min(_ext_tail_px, len(_af_rows))
-                        _seg_r = _af_rows[:_n]
-                        _seg_c = _af_cols[:_n]
-                        try:
-                            _slp_h, _icp_h = np.polyfit(_seg_r, _seg_c, 1)
-                        except Exception:
-                            _slp_h = float(_seg_c[-1] - _seg_c[0]) / max(float(_seg_r[-1] - _seg_r[0]), 1.0)
-                            _icp_h = float(_seg_c[0]) - _slp_h * float(_seg_r[0])
-                        _head_pts = []
-                        _ex_rows_h = set(int(p[0]) for p in _af_sorted)
-                        for _er in range(_tgt_r0, _cur_r0):
-                            if _er in _ex_rows_h:
-                                continue
-                            _ec = float(np.clip(_slp_h * _er + _icp_h, 0, _img_W - 1))
-                            # 不超过同行皮质线2列坐标（保持在椎体侧）
-                            _c2_col_h = float(np.interp(_er, _c2r_ext, _c2c_ext))
-                            _ec = min(_ec, _c2_col_h)
-                            _head_pts.append((_er, _ec, 0.0, _c2_col_h, 'extrapolated'))
-                        if _head_pts:
-                            arc_final_v13 = _head_pts + _af_sorted
-                            arc_final_v13 = sorted(arc_final_v13, key=lambda p: p[0])
-                            print(f"   [前缘头部外推] 补充 {len(_head_pts)} 行 "
-                                  f"({_tgt_r0}→{_cur_r0-1}), 斜率dc/dr={_slp_h:.4f}")
+    # 皮质线1尾部延伸
+    c1_rows_ext, c1_cols_ext = _extend_line_tail(
+        c1_rows, c1_cols, pixel_spacing, extend_mm=5.0, ref_mm=5.0)
 
-                    # ── 尾部补充（向下）：从 arc_min_pts_v13 查表，取密集空间每行谷底 ──
-                    _af_sorted2 = sorted(arc_final_v13, key=lambda p: p[0])
-                    _cur_r1 = int(float(_af_sorted2[-1][0]))
-                    if _cur_r1 < _tgt_r1:
-                        # 建立谷底查找表：row -> (row, col, val, base_col)
-                        _min_lut = {int(mp[0]): mp for mp in arc_min_pts_v13}
-                        _tail_pts = []
-                        _ex_rows_t = set(int(p[0]) for p in _af_sorted2)
-                        for _er in range(_cur_r1 + 1, _tgt_r1 + 1):
-                            if _er in _ex_rows_t:
-                                continue
-                            if _er in _min_lut:
-                                _mp = _min_lut[_er]
-                                _tail_pts.append((_mp[0], _mp[1], _mp[2], _mp[3], 'kept'))
-                        if _tail_pts:
-                            arc_final_v13 = _af_sorted2 + _tail_pts
-                            arc_final_v13 = sorted(arc_final_v13, key=lambda p: p[0])
-                            print(f"   [前缘尾部谷底补充] 补充 {len(_tail_pts)} 行 "
-                                  f"({_cur_r1+1}→{_tgt_r1})，来源=arc_min_pts_v13")
+    # 皮质线2-2（由延伸后皮质线1派生）
+    _c1_cols_arr = np.array(c1_cols_ext, dtype=np.float32)
+    _smooth_mm   = SMOOTH_MM_C2
+    _k = max(3, int(_smooth_mm / pixel_spacing))
+    if _k % 2 == 0: _k += 1
+    _pad    = _k // 2
+    _padded = np.pad(_c1_cols_arr.astype(np.float64), _pad, mode='edge')
+    _kernel = np.ones(_k) / _k
+    _c2_cols_smooth = np.convolve(_padded, _kernel, mode='valid').astype(np.float32)
+    _c2_cols_fixed = _repair_slope(_c2_cols_smooth)
+    c2_rows_mode4 = list(c1_rows_ext)
+    c2_cols_mode4 = list(_c2_cols_fixed)
 
-                # 存入v9_data供可视化使用
-                v9_data['arc_min_pts_v13']       = arc_min_pts_v13
-                v9_data['arc_refined1_v13']      = arc_refined1_v13
-                v9_data['arc_filtered_v13']      = arc_filtered_v13
-                v9_data['arc_best_range1_v13']   = arc_best_range1_v13   # 第一次密集窗口（纯上升沿）
-                v9_data['arc_best_range_v13']    = arc_best_range_v13
-                v9_data['arc_refined2_raw_v13'] = arc_filtered_v13   # 单轮：filtered即为最终精修点
-                v9_data['arc_refined_v13']      = arc_final_v13
-                v9_data['arc_left_off_mm_v13']  = 20.0
-                v9_data['arc_right_off_mm_v13'] = 40.0
-                v9_data['arc_off_expand_v13']   = 1.5
-                print(f"   [V13前缘-单轮] 谷底:{len(arc_min_pts_v13)}, "
-                      f"精修:{len(arc_refined1_v13)}, 密集窗口:{len(arc_filtered_v13)}, "
-                      f"最终:{len(arc_final_v13)}")
+    # 加载 IN 序列
+    print("\n── 加载 IN 序列 ──")
+    in_img_2d, in_meta, in_nii_path = find_in_image(
+        nifti_path, slice_idx=best_slice_idx)
+    if in_img_2d is None:
+        print("   ❌ 未找到IN序列，跳过 mode4")
+        return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
 
-                # Step5: 新方案：腹侧下降沿法找前缘（并行运行）
-                _consensus_eps = v9_data.get('consensus_endplates_v15', [])
-                _dr3 = f_data_v15.get('drop_ratio3') if f_data_v15 else None
-                # 从 scan_lines_v15 第一条提取法线方向（各条扫描线 nx/ny相同）
-                _sl_v15 = v9_data.get('scan_lines_v15', [])
-                _nx_arr_d = _sl_v15[0][3] if _sl_v15 else None
-                _ny_arr_d = _sl_v15[0][4] if _sl_v15 else None
-                arc_descent_v13 = find_anterior_edge_by_descent(
-                    c2_cols          = _c2_cols,
-                    c2_rows          = _c2_rows,
-                    f_img_2d         = f_img_2d,
-                    pixel_spacing    = pixel_spacing,
-                    consensus_endplates = _consensus_eps,
-                    high_mean3       = _ant_high_mean if _ant_high_mean else 200.0,
-                    low_mean3        = _ant_low_mean  if _ant_low_mean  else 50.0,
-                    drop_ratio3      = _dr3 if _dr3 else 0.35,
-                    nx_arr           = _nx_arr_d,
-                    ny_arr           = _ny_arr_d,
-                    scan_lines_v15   = _sl_v15,
-                )
-                v9_data['arc_descent_v13'] = arc_descent_v13
+    H_in, W_in = in_img_2d.shape
 
-                # ── V14_1: 椎间盘区域前缘点过滤（最后两组椎间盘）──
-                # 需要过滤：最后两组椎间盘区域内部的点
-                # 椎间盘区域 = inferior → superior 之间的行号范围
-                _ax_cv15 = v9_data.get('consensus_endplates_v15', [])
-                _scan_lines_v15 = v9_data.get('scan_lines_v15', [])
-                
-                print(f"   [V14_1 调试] consensus_endplates_v15: {len(_ax_cv15)} 条")
-                print(f"   [V14_1 调试] scan_lines_v15: {len(_scan_lines_v15)} 条")
-                print(f"   [V14_1 调试] arc_descent_v13: {len(arc_descent_v13) if arc_descent_v13 else 0} 点")
-                
-                # 打印所有终板线信息
-                print(f"   [V14_1 调试] 全部终板线列表:")
-                for idx, ep in enumerate(_ax_cv15):
-                    print(f"     [{idx}] ep_type={ep.get('ep_type')}, row={ep.get('row_center'):.1f}, points={len(ep.get('points', []))}")
-                
-                if len(_ax_cv15) >= 4 and _scan_lines_v15 and arc_descent_v13:
-                    # ── V14_1: 从后往前扫描，找到最后两组椎间盘 ──
-                    # 解剖学关系：inferior → superior = 椎间盘 (5-15mm)
-                    # 扫描策略：如果最后一条是 inferior 则丢弃，从第一个 superior 开始交替查找
-                    
-                    print(f"   [V14_1 扫描] 检查最后一条终板线类型...")
-                    last_ep_type = _ax_cv15[-1].get('ep_type')
-                    print(f"     最后一条 [{len(_ax_cv15)-1}] ep_type={last_ep_type}")
-                    
-                    # 确定起始索引
-                    start_idx = len(_ax_cv15) - 1
-                    if last_ep_type == 'inferior':
-                        print(f"     → 最后一条是 inferior，丢弃，从倒数第二条开始")
-                        start_idx = len(_ax_cv15) - 2
-                    
-                    # 从后往前扫描，收集 4 条有效的终板线（2 个 superior + 2 个 inferior，交替）
-                    valid_endplates = []  # [(index, ep), ...]
-                    expect_superior = True  # 期望找到 superior（因为从后往前是先遇到 superior）
-                    
-                    print(f"   [V14_1 扫描] 开始从后往前扫描，start_idx={start_idx}, 期望先找 superior")
-                    for i in range(start_idx, -1, -1):  # 从最后一个往前
-                        ep = _ax_cv15[i]
-                        ep_type = ep.get('ep_type')
-                        
-                        print(f"     检查 [{i}] ep_type={ep_type}, expect_superior={expect_superior}")
-                        
-                        # 按期望类型匹配（交替查找）
-                        if expect_superior and ep_type == 'superior':
-                            valid_endplates.append((i, ep))
-                            expect_superior = False  # 下一个期望 inferior
-                            print(f"       → 选中 superior (第{len(valid_endplates)}条)")
-                        elif not expect_superior and ep_type == 'inferior':
-                            valid_endplates.append((i, ep))
-                            expect_superior = True  # 下一个期望 superior
-                            print(f"       → 选中 inferior (第{len(valid_endplates)}条)")
-                        else:
-                            print(f"       → 跳过 (类型不符)")
-                        
-                        # 找到 4 条就停止
-                        if len(valid_endplates) == 4:
-                            print(f"   [V14_1 扫描] 已找到 4 条，停止扫描")
-                            break
-                    
-                    print(f"   [V14_1 调试] 从后往前找到 {len(valid_endplates)} 条有效终板线")
-                    for idx, (orig_idx, ep) in enumerate(valid_endplates):
-                        print(f"     [{idx}] 原索引={orig_idx}, ep_type={ep.get('ep_type')}, "
-                              f"row={ep.get('row_center')}, points={len(ep.get('points', []))}")
-                    
-                    # 需要至少找到 4 条（2 个 inferior + 2 个 superior）
-                    if len(valid_endplates) >= 4:
-                        # 从后往前找到的顺序：
-                        # valid_endplates[0] = 最后一个 inferior（最靠近尾部）
-                        # valid_endplates[1] = 最后一个 superior
-                        # valid_endplates[2] = 倒数第二个 inferior
-                        # valid_endplates[3] = 倒数第二个 superior（最靠近头部）
-                        
-                        # 最后一组椎间盘：最后一个 inferior → 最后一个 superior
-                        last_disc_inferior = valid_endplates[0][1]   # 最后面的 inferior
-                        last_disc_superior = valid_endplates[1][1]   # 最后面的 superior
-                        
-                        # 倒数第二组椎间盘：倒数第二个 inferior → 倒数第二个 superior
-                        second_last_disc_inferior = valid_endplates[2][1]
-                        second_last_disc_superior = valid_endplates[3][1]
-                        
-                        print(f"   [V14_1 调试] 最后一组椎间盘：inferior row={last_disc_inferior.get('row_center')}, "
-                              f"superior row={last_disc_superior.get('row_center')}")
-                        print(f"   [V14_1 调试] 倒数第二组椎间盘：inferior row={second_last_disc_inferior.get('row_center')}, "
-                              f"superior row={second_last_disc_superior.get('row_center')}")
-                    else:
-                        print(f"   [V14_1 警告] 未找到足够的终板线构建最后两组椎间盘")
-                        last_disc_inferior = None
-                        last_disc_superior = None
-                        second_last_disc_inferior = None
-                        second_last_disc_superior = None
-                    
-                    # ── V14_1: 为每个椎间盘单独计算基准线并过滤 ──
-                    # 每个椎间盘用自己的基准线过滤自己区域内的点
-                    # 椎间盘行号范围 = 同一条扫描线上与上下终板标记点的行号
-                                                            
-                    disc_baselines = {}  # {disc_idx: baseline_offset}
-                    disc_row_ranges = []  # [(row_min, row_max), ...]
-                                        
-                    # 获取终板候选点（包含 line_idx）
-                    raw_cands_v15 = v9_data.get('raw_candidates_v15', [])
-                                                            
-                    for disc_idx, (inf_ep, sup_ep) in enumerate([
-                        (last_disc_inferior, last_disc_superior),      # 最后一组
-                        (second_last_disc_inferior, second_last_disc_superior)  # 倒数第二组
-                    ]):
-                        if inf_ep is None or sup_ep is None:
-                            continue
-                                            
-                        # 从 offset 最大（最左/腹侧）的扫描线开始向右（背侧）扫描
-                        scan_lines_sorted = sorted(_scan_lines_v15, key=lambda x: x[0], reverse=True)
-                                            
-                        baseline_offset = None
-                        disc_top_row = None    # 椎间盘顶部行号（上终板标记点）
-                        disc_bottom_row = None # 椎间盘底部行号（下终板标记点）
-                                            
-                        for sl in scan_lines_sorted:
-                            offset_mm, rows_arr, cols_arr, nx_arr, ny_arr = sl
-                                                    
-                            # 在这条扫描线上找上下终板的标记点
-                            has_inferior_on_line = False
-                            has_superior_on_line = False
-                            row_inf = None
-                            row_sup = None
-                                                    
-                            # 检查下终板标记点是否在这条扫描线上
-                            inf_pts = inf_ep.get('points', [])
-                            for inf_pt in inf_pts:
-                                inf_row, inf_col = int(inf_pt[0]), int(inf_pt[1])
-                                # 检查是否在扫描线上
-                                for ri, ci in zip(rows_arr, cols_arr):
-                                    if abs(ri - inf_row) <= 1 and abs(ci - inf_col) <= 2:
-                                        has_inferior_on_line = True
-                                        row_inf = float(ri)
-                                        break
-                                if has_inferior_on_line:
-                                    break
-                                                    
-                            # 检查上终板标记点是否在这条扫描线上
-                            sup_pts = sup_ep.get('points', [])
-                            for sup_pt in sup_pts:
-                                sup_row, sup_col = int(sup_pt[0]), int(sup_pt[1])
-                                for ri, ci in zip(rows_arr, cols_arr):
-                                    if abs(ri - sup_row) <= 1 and abs(ci - sup_col) <= 2:
-                                        has_superior_on_line = True
-                                        row_sup = float(ri)
-                                        break
-                                if has_superior_on_line:
-                                    break
-                                                    
-                            # 如果这条扫描线上同时有上下终板标记点，就是基准线
-                            if has_inferior_on_line and has_superior_on_line:
-                                baseline_offset = offset_mm
-                                disc_top_row = row_sup
-                                disc_bottom_row = row_inf
-                                print(f"   [椎间盘{disc_idx+1}] 基准线 offset={baseline_offset:.1f}mm, "
-                                      f"扫描线上终板标记点行号：{disc_top_row:.1f}~{disc_bottom_row:.1f}")
-                                break
-                                                
-                        if baseline_offset is None:
-                            print(f"   [警告] 椎间盘{disc_idx+1}未找到基准线！")
-                            print(f"     下终板点数：{len(inf_ep.get('points', []))}, "
-                                  f"上终板点数：{len(sup_ep.get('points', []))}")
-                                            
-                        if baseline_offset is not None:
-                            disc_baselines[disc_idx] = baseline_offset
-                            if disc_top_row is not None and disc_bottom_row is not None:
-                                row_min = min(disc_top_row, disc_bottom_row)
-                                row_max = max(disc_top_row, disc_bottom_row)
-                                disc_row_ranges.append((row_min, row_max))
-                                        
-                    print(f"   [椎间盘过滤] 各椎间盘基准线：{disc_baselines}")
-                    print(f"   [椎间盘过滤] 椎间盘行号范围（扫描线标记点）: {disc_row_ranges}")
-                                        
-                    # 存入 v9_data 供可视化使用
-                    v9_data['disc_row_ranges'] = disc_row_ranges
-                    v9_data['disc_baselines'] = disc_baselines
-                                        
-                    # 过滤 arc_descent_v13 中位于椎间盘区域内的点
-                    filtered_arc = []
-                    for pt in arc_descent_v13:
-                        row, col, flag, src_tag, base_col = pt
-                        pt_row = float(row)
-                                            
-                        # 计算该点的 offset
-                        pt_offset = (base_col - col) * pixel_spacing
-                                            
-                        # 检查该点属于哪个椎间盘区域
-                        keep_point = True
-                        for disc_idx, (row_min, row_max) in enumerate(disc_row_ranges):
-                            if row_min - 1e-6 <= pt_row <= row_max + 1e-6:
-                                # 点在椎间盘 disc_idx 区域内，用该椎间盘的基准线过滤
-                                if disc_idx in disc_baselines:
-                                    if pt_offset < disc_baselines[disc_idx] - 1e-6:
-                                        keep_point = False
-                                        print(f"   [下降沿过滤] 点 (row={pt_row:.1f}, offset={pt_offset:.1f}mm) "
-                                              f"在椎间盘{disc_idx+1}内，offset<{disc_baselines[disc_idx]:.1f}mm → 过滤")
-                                break
-                                            
-                        if keep_point:
-                            filtered_arc.append(pt)
-                                        
-                    if len(filtered_arc) < len(arc_descent_v13):
-                        print(f"   [椎间盘过滤] 下降沿 {len(arc_descent_v13) - len(filtered_arc)} 个点被过滤 "
-                              f"({len(filtered_arc)}/{len(arc_descent_v13)} 保留)")
-                                        
-                    # 更新 arc_descent_v13
-                    arc_descent_v13 = filtered_arc
-                    v9_data['arc_descent_v13'] = filtered_arc
-                                        
-                    # ── V14_1: 过滤上升沿点 arc_refined1_v13 ──
-                    if arc_refined1_v13:
-                        filtered_rise = []
-                        for pt in arc_refined1_v13:
-                            # 格式：(row, col, val, base_col, flag)
-                            if len(pt) >= 5:
-                                pt_row = float(pt[0])
-                                col = float(pt[1])
-                                base_col = float(pt[3])
-                                pt_offset = (base_col - col) * pixel_spacing
-                                                    
-                                # 检查该点属于哪个椎间盘区域
-                                keep_point = True
-                                for disc_idx, (row_min, row_max) in enumerate(disc_row_ranges):
-                                    if row_min - 1e-6 <= pt_row <= row_max + 1e-6:
-                                        # 点在椎间盘 disc_idx 区域内，用该椎间盘的基准线过滤
-                                        if disc_idx in disc_baselines:
-                                            if pt_offset < disc_baselines[disc_idx] - 1e-6:
-                                                keep_point = False
-                                        break
-                                                    
-                                if keep_point:
-                                    filtered_rise.append(pt)
-                                            
-                        if len(filtered_rise) < len(arc_refined1_v13):
-                            print(f"   [椎间盘过滤] 上升沿 {len(arc_refined1_v13) - len(filtered_rise)} 个点被过滤 "
-                                  f"({len(filtered_rise)}/{len(arc_refined1_v13)} 保留)")
-                                            
-                        # 更新 arc_refined1_v13
-                        arc_refined1_v13 = filtered_rise
-                        v9_data['arc_refined1_v13'] = filtered_rise
+    # Step1
+    print("\n── Step1: 信号参考值 ──")
+    low_mean, high_mean, profile_pts = compute_signal_references(
+        in_img_2d, c2_rows_mode4, c2_cols_mode4, pixel_spacing, offset_mm=OFFSET_MM_SIGNAL)
 
-                # Step5.1: 将下降沿 confirmed 点转换为统一格式，合并进密集窗口重跌
-                # 下降沿点格式: (row, col, flag, src_tag, base_col)
-                # 统一格式: (row, col, val, base_col, flag) -- 与 arc_refined1_v13 一致
-                _descent_for_dense = []
-                for _dp in arc_descent_v13:
-                    if len(_dp) >= 5 and _dp[2] == 'confirmed':
-                        _dp_row     = float(_dp[0])
-                        _dp_col     = float(_dp[1])
-                        _dp_basecol = float(_dp[4])
-                        _descent_for_dense.append((_dp_row, _dp_col, 0.0, _dp_basecol, 'refined'))
+    # Step2
+    print("\n── Step2: 终板汇合点扫描 ──")
+    junction_pts, anchor_pts_list = scan_endplate_junction_points(
+        in_img_2d, c2_rows_mode4, c2_cols_mode4,
+        pixel_spacing, low_mean)
+    if len(junction_pts) < 2:
+        print("   ❌ 终板汇合点不足2个，跳过mode4")
+        return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
 
-                # 合并上升沿点（排除 kept_low）+ 下降沿 confirmed 点
-                _combined_for_dense = [
-                    p for p in arc_refined1_v13
-                    if not (len(p) > 4 and p[4] in ('kept_low', 'kept'))
-                ] + _descent_for_dense
+    # Step2b
+    print("\n── Step2b: 终板汇合点修补 ──")
+    junction_pts, anchor_pts_list = repair_junction_pts(
+        junction_pts, anchor_pts_list,
+        c2_rows_mode4, c2_cols_mode4, pixel_spacing,
+        in_img_2d=in_img_2d, c2_rows_scan=c2_rows_mode4, c2_cols_scan=c2_cols_mode4,
+        low_mean=low_mean)
 
-                # ── 调试：打印合并点集 offset 分布 ──
-                if _combined_for_dense:
-                    _dbg_offs = sorted([(pt[3] - pt[1]) * pixel_spacing for pt in _combined_for_dense])
-                    _dbg_rise = [p for p in arc_refined1_v13 if not (len(p) > 4 and p[4] in ('kept_low', 'kept'))]
-                    print(f"   [调试-第二次密集] 合并点总数={len(_combined_for_dense)}"
-                          f"（上升沿refined={len(_dbg_rise)}, 下降沿confirmed={len(_descent_for_dense)}）")
-                    print(f"   [调试-第二次密集] offset范围: {_dbg_offs[0]:.1f}~{_dbg_offs[-1]:.1f}mm"
-                          f"，中位数={_dbg_offs[len(_dbg_offs)//2]:.1f}mm")
-                    # 打印offset直方图（每2mm一个桶）
-                    import math
-                    _lo_b = math.floor(_dbg_offs[0])
-                    _hi_b = math.ceil(_dbg_offs[-1])
-                    _buckets = {}
-                    for _o in _dbg_offs:
-                        _b = int((_o - _lo_b) // 2) * 2 + _lo_b
-                        _buckets[_b] = _buckets.get(_b, 0) + 1
-                    for _bk in sorted(_buckets):
-                        print(f"     offset [{_bk:5.1f}~{_bk+2:.1f}mm]: {'█' * _buckets[_bk]} ({_buckets[_bk]})")
+    # Step3
+    print("\n── Step3: 椎间盘/椎体中心 ──")
+    disc_centers, vert_centers = compute_disc_and_vertebra_centers(
+        junction_pts, c2_rows_mode4, c2_cols_mode4, pixel_spacing,
+        extend_start_mm=15.0, extend_end_mm=20.0, merge_dist_mm=5.0)
+    if not vert_centers:
+        print("   ❌ 未能生成椎体中心点，跳过mode4")
+        return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
 
-                # 用合并点集重新计算密集窗口
-                if _combined_for_dense:
-                    arc_filtered_v13, arc_best_range_v13 = filter_arc_roi_by_dense_offset(
-                        _combined_for_dense, pixel_spacing, window_mm=6.0, step_mm=0.5,
-                        expand_ratio=_dense_expand_v13)
-                    # 额外统计：用动态扩展窗口分别统计两个位置的点数（对比用）
-                    _r1_lo   = arc_best_range1_v13[0]
-                    _r1_hi   = arc_best_range1_v13[1]
-                    _r2_lo   = arc_best_range_v13[0]
-                    _r2_hi   = arc_best_range_v13[1]
-                    _dexp    = v9_data.get('dense_expand_v13', 3.0) if v9_data else 3.0
-                    _c2r_st  = v9_data.get('c2_rows')
-                    if _c2r_st is not None and len(_c2r_st) > 0:
-                        _rmin_st = float(min(_c2r_st)); _rmax_st = float(max(_c2r_st))
-                    else:
-                        _rmin_st = float(min(p[0] for p in _combined_for_dense))
-                        _rmax_st = float(max(p[0] for p in _combined_for_dense))
-                    _rspan_st = max(_rmax_st - _rmin_st, 1.0)
-                    _cnt_in_r1 = 0
-                    _cnt_in_r2 = 0
-                    for _p in _combined_for_dense:
-                        _t_st  = (float(_p[0]) - _rmin_st) / _rspan_st
-                        _off_p = (float(_p[3]) - float(_p[1])) * pixel_spacing
-                        # 第一次窗口（动态扩展）
-                        _hi1_dyn = _r1_lo + (_r1_hi - _r1_lo) * (1.0 + (_dexp - 1.0) * _t_st)
-                        if _r1_lo - 1e-6 <= _off_p <= _hi1_dyn + 1e-6:
-                            _cnt_in_r1 += 1
-                        # 第二次窗口（动态扩展）
-                        _hi2_dyn = _r2_lo + (_r2_hi - _r2_lo) * (1.0 + (_dexp - 1.0) * _t_st)
-                        if _r2_lo - 1e-6 <= _off_p <= _hi2_dyn + 1e-6:
-                            _cnt_in_r2 += 1
-                    print(f"   [V13密集窗口-双模态] 上升沿:{len(arc_refined1_v13)}点 + "
-                          f"下降沿 confirmed:{len(_descent_for_dense)}点 → "
-                          f"第二次窗口:{_r2_lo:.1f}~{_r2_hi:.1f}mm（动态{_cnt_in_r2}点）"
-                          f" | 第一次窗口:{_r1_lo:.1f}~{_r1_hi:.1f}mm（动态{_cnt_in_r1}点）")
+    # Step3.5: 最后两椎体椎间盘中心角度自适应校验（无条件执行）
+    print("\n── Step3.5: 最后两椎体汇合点校验 ──")
+    angle_last = None   # 保留供 Step4/Step5 使用
+    angle_2nd  = None   # 保留供 Step5 使用
 
-                # 存入 v9_data 供可视化使用
-                v9_data['arc_combined_v13']   = _combined_for_dense
-                v9_data['arc_filtered_v13']   = arc_filtered_v13
-                v9_data['arc_best_range_v13'] = arc_best_range_v13
+    def _calc_junc_angle(jt, jb):
+        d_r = float(jb[0]) - float(jt[0])
+        d_c = float(jb[1]) - float(jt[1])
+        return abs(math.degrees(math.atan2(abs(d_r), abs(d_c) + 1e-9)))
+
+    if len(junction_pts) >= 2 and len(anchor_pts_list) >= 1 and len(disc_centers) >= 1:
+        angle_last = _calc_junc_angle(junction_pts[-2], junction_pts[-1])
+        print(f"   [Step3.5] 最后椎体连线夹角={angle_last:.1f}° → 执行校验")
+        updated, new_disc, _ = verify_last_junction_point(
+            in_img_2d, junction_pts[-1], anchor_pts_list[-1], disc_centers[-1],
+            c2_rows_mode4, c2_cols_mode4, pixel_spacing, high_mean,
+            angle_deg=angle_last)
+        if updated:
+            disc_centers[-1] = new_disc
+            if len(disc_centers) >= 2:
+                a = disc_centers[-2]; b = disc_centers[-1]
+                vert_centers[-1] = ((a[0]+b[0])/2.0, (a[1]+b[1])/2.0)
+
+    if len(junction_pts) >= 3 and len(anchor_pts_list) >= 2 and len(disc_centers) >= 2:
+        angle_2nd = _calc_junc_angle(junction_pts[-3], junction_pts[-2])
+        print(f"   [Step3.5] 倒数第二椎体连线夹角={angle_2nd:.1f}° → 执行校验")
+        updated_sl, new_disc_sl, _ = verify_last_junction_point(
+            in_img_2d, junction_pts[-2], anchor_pts_list[-2], disc_centers[-2],
+            c2_rows_mode4, c2_cols_mode4, pixel_spacing, high_mean,
+            angle_deg=angle_2nd)
+        if updated_sl:
+            disc_centers[-2] = new_disc_sl
+            if len(disc_centers) >= 3:
+                a = disc_centers[-3]; b = disc_centers[-2]
+                vert_centers[-2] = ((a[0]+b[0])/2.0, (a[1]+b[1])/2.0)
+
+    # Step4: 终板扫描（支持扇形/矩阵两种模式）
+    print("\n── Step4: 终板扫描 ──")
+    ep_scan_mode = 'disc'  # 'fan' = 扇形扫描（现有），'disc' = 椎间盘矩阵扫描（新）
+    scan_results = []
+    fan_params_list = []
+    n_total_vert = len(vert_centers)
+    for vi, vc in enumerate(vert_centers):
+        print(f"   椎体{vi}...")
+        _disc_top = disc_centers[vi]     if vi < len(disc_centers) else None
+        _disc_bot = disc_centers[vi + 1] if vi + 1 < len(disc_centers) else None
+
+        _is_last_vert = (vi == n_total_vert - 1)
+
+        _ant_low_mean = None
+        _ant_high_mean_local = None
+        if vi >= n_total_vert - 2:
+            _ant_ang = _calc_ant_angle_deg(vc, c2_rows_mode4, c2_cols_mode4,
+                                           _disc_top, _disc_bot)
+            _alm, _ahm = _sample_ant_local_signal(
+                in_img_2d, float(vc[0]), float(vc[1]),
+                _ant_ang, fan_step_deg=2.0, scan_mm=40.0,
+                pixel_spacing=pixel_spacing)
+            if _alm is not None:
+                _ant_low_mean = _alm
+                _ant_high_mean_local = _ahm
+                _local_tag = 'last' if _is_last_vert else '2nd-last'
+                print(f"      [局部信号] 椎体{vi}({_local_tag}) ant_ang={_ant_ang:.1f}°  "
+                      f"local_low={_alm:.1f}  local_high={_ahm:.1f}  "
+                      f"(全局 low={low_mean:.1f} high={high_mean:.1f})")
+
+        _ant_diag = (_is_last_vert and angle_last is not None and angle_last < 65.0)
+
+        if ep_scan_mode == 'disc':
+            # 椎间盘矩阵扫描模式（仅终板，前缘仍用扇形）
+            _sup_pts = []
+            _inf_pts = []
+            
+            # 上终板用 disc_centers[vi] 和 junction_pts[vi]
+            if _disc_top is not None and vi < len(junction_pts):
+                _j_top = junction_pts[vi]
             else:
-                print("   [V15] 跳过V15聚类（c2_cols/scan_lines_v15 缺失）")
-    
+                _j_top = None
+            
+            # 下终板用 disc_centers[vi+1] 和 junction_pts[vi+1]
+            if _disc_bot is not None and vi + 1 < len(junction_pts):
+                _j_bot = junction_pts[vi + 1]
+            else:
+                _j_bot = None
+            
+            # 至少需要一个junction_pt才能构造起点连线
+            if _j_top is not None and _j_bot is not None:
+                _sr = scan_disc_endplates(
+                    in_img_2d, vc, _j_top, _j_bot,
+                    c2_rows_mode4, c2_cols_mode4, pixel_spacing,
+                    low_mean, high_mean, scan_up_mm=30.0, scan_dn_mm=30.0,
+                    drop_ratio=0.35)
+                _sup_pts = _sr['sup_pts']
+                _inf_pts = _sr['inf_pts']
+            
+            # 前缘仍用扇形扫描
+            _ant_lm = _ant_low_mean if _ant_low_mean is not None else low_mean
+            _ant_hm = _ant_high_mean_local if _ant_high_mean_local is not None else high_mean
+            _ant_scan_fn = _scan_normal_descent_ant_diag if _ant_diag else _scan_normal_descent_ant
+            _ant_angle_deg = _calc_ant_angle_deg(vc, c2_rows_mode4, c2_cols_mode4, _disc_top, _disc_bot)
+            # S1 前缘信号对比度低，单独放宽下降沿阈值
+            _ant_drop = 0.20 if _ant_diag else 0.35
+            if _ant_diag:
+                print(f"      [前缘S1] drop_ratio={_ant_drop:.2f} (全局0.35)")
+            ant_pts, ant_dirs = _fan_scan_direction(
+                float(vc[0]), float(vc[1]),
+                _ant_angle_deg,
+                50.0, 2.0, 40.0, pixel_spacing, in_img_2d,
+                _ant_lm, _ant_hm,
+                drop_ratio=_ant_drop, low_ratio=1.3, scan_fn=_ant_scan_fn)
+            
+            sr = {
+                'sup': {'points': _sup_pts} if _sup_pts else None,
+                'inf': {'points': _inf_pts} if _inf_pts else None,
+                'ant': {'points': ant_pts, 'dirs': ant_dirs} if ant_pts else None,
+                'fan_params': None,
+                'ant_fan_params': {
+                    'center': (float(vc[0]), float(vc[1])),
+                    'angle':  _ant_angle_deg,
+                    'half':   50.0,
+                    'scan_mm': 40.0,
+                },
+            }
+            sr['ant_high_mean_local'] = _ant_high_mean_local
         else:
-            print("   ⚠️ 未找到压水图，跳过终板检测")
-    
-    print("\n🎨 生成可视化...")
-    vert_chain = visualize_results(slice_2d, traced, cord_mask, roi_points,
-                     valid_rows, pixel_spacing, output_path, processor, v9_data,
-                     f_img_2d=f_img_2d, f_data=f_data,
-                     best_slice_idx=best_slice_idx, total_slices=data.shape[2])
+            # 扇形扫描模式（原有逻辑）
+            sr = fan_scan_vertebra(
+                in_img_2d, vc, c2_rows_mode4, c2_cols_mode4, pixel_spacing, low_mean,
+                fan_half_deg=50.0, fan_step_deg=2.0,
+                scan_up_mm=30.0, scan_dn_mm=30.0, scan_ant_mm=40.0,
+                low_ratio=1.3,
+                high_mean=high_mean,
+                drop_ratio=0.25,
+                ant_drop_ratio=0.35,
+                disc_top=_disc_top, disc_bot=_disc_bot,
+                fan_half_ep_deg=60.0,
+                ant_low_mean=_ant_low_mean,
+                ant_high_mean=_ant_high_mean_local if _ant_high_mean_local is not None else high_mean,
+                ant_diag_confirm=_ant_diag,
+                ep_diag_confirm=_ant_diag)
+            if _ant_diag:
+                print(f"      [Step4前缘] 最后椎体后缘角={angle_last:.1f}°<65° → 启用对角信号确认（前缘\\+终板）")
+            sr['ant_high_mean_local'] = _ant_high_mean_local
+        scan_results.append(sr)
+        fan_params_list.append(sr.get('fan_params'))
 
-    # ===== 导出掩模 + 坐标 CSV =====
-    if vert_chain and f_img_2d is not None:
-        print("\n📦 导出椎体掩模与几何数据...")
-        orig_affine = nib.load(nifti_path).affine if nifti_path else None
-        export_vertebra_data(vert_chain, f_img_2d.shape, output_path, pixel_spacing,
-                             orig_affine=orig_affine)
-        
-    # 恢复标准输出
-    sys.stdout = original_stdout
-    
-    # 提取关键信息
-    log_content = log_capture.getvalue()
-    # 将日志按行分割成列表
-    log_lines = log_content.split('\n')
-    
-    json_filename = output_filename.replace('_TRACED.png', '_LOG.json')
-    json_path = os.path.join(output_dir, json_filename)
-    
-    # 提取关键信息
-    log_data = {
-        'patient_dir': patient_dir,
-        'seq_dir': seq_dir,
-        'nifti_path': nifti_path,
-        'best_slice_idx': int(best_slice_idx) if best_slice_idx is not None else None,
-        'total_slices': data.shape[2] if 'data' in dir() else None,
-        'pixel_spacing': pixel_spacing,
-        'merged_regions': merged_regions,
+    # Step4c: 前缘二次校验（夹角 < 65° 才执行，高倾角骶椎区域跳过）
+    last_junc_angle_deg        = None
+    second_last_junc_angle_deg = None
+    n_vert = len(scan_results)
+    if len(junction_pts) >= 2 and n_vert >= 1:
+        jt = junction_pts[-2]; jb = junction_pts[-1]
+        last_junc_angle_deg = abs(math.degrees(
+            math.atan2(abs(float(jb[0])-float(jt[0])),
+                       abs(float(jb[1])-float(jt[1])) + 1e-9)))
+        print(f"\n── Step4c: 最后椎体汇合点夹角={last_junc_angle_deg:.1f}°")
+        if last_junc_angle_deg < 65.0:
+            last_sr = scan_results[-1]
+            _hm = last_sr.get('ant_high_mean_local') or high_mean
+            _ant_ang_last = (last_sr.get('fan_params') or {}).get('ant', {}).get('angle')
+            if _ant_ang_last is None:
+                _ant_ang_last = (last_sr.get('ant_fan_params') or {}).get('angle')
+            
+            # 兼容两种格式：disc模式用 ant['points']/ant['dirs']，fan模式用 ant_pts/ant_dirs
+            if 'ant' in last_sr:
+                _ant_data = last_sr.get('ant')
+                _pts = _ant_data.get('points', []) if _ant_data else []
+                _dirs = _ant_data.get('dirs', []) if _ant_data else []
+                _before = len(_pts)
+                if _pts:
+                    kept_pts, kept_dirs = _verify_ant_pts_forward(
+                        _pts, _dirs, in_img_2d, pixel_spacing, _hm, forward_mm=5.0,
+                        ant_angle_deg=_ant_ang_last)
+                    last_sr['ant'] = {'points': kept_pts, 'dirs': kept_dirs}
+            else:
+                _pts = last_sr.get('ant_pts', [])
+                _dirs = last_sr.get('ant_dirs', [])
+                _before = len(_pts)
+                if _pts:
+                    kept_pts, kept_dirs = _verify_ant_pts_forward(
+                        _pts, _dirs, in_img_2d, pixel_spacing, _hm, forward_mm=5.0,
+                        ant_angle_deg=_ant_ang_last)
+                    last_sr['ant_pts'] = kept_pts
+                    last_sr['ant_dirs'] = kept_dirs
+            
+            _after = len(last_sr.get('ant', {}).get('points', [])) if 'ant' in last_sr else len(last_sr.get('ant_pts', []))
+            print(f"   [Step4c] 最后椎体前缘二次校验: {_before} → {_after} 点保留")
+        else:
+            print(f"   [Step4c] 最后椎体夹角={last_junc_angle_deg:.1f}° ≥ 65°，跳过前缘二次校验")
+
+    if len(junction_pts) >= 3 and n_vert >= 2:
+        jt2 = junction_pts[-3]; jb2 = junction_pts[-2]
+        second_last_junc_angle_deg = abs(math.degrees(
+            math.atan2(abs(float(jb2[0])-float(jt2[0])),
+                       abs(float(jb2[1])-float(jt2[1])) + 1e-9)))
+        print(f"── Step4c: 倒数第二椎体汇合点夹角={second_last_junc_angle_deg:.1f}°")
+        if second_last_junc_angle_deg < 65.0:
+            sl_sr = scan_results[-2]
+            _hm2 = sl_sr.get('ant_high_mean_local') or high_mean
+            _ant_ang_sl = (sl_sr.get('fan_params') or {}).get('ant', {}).get('angle')
+            if _ant_ang_sl is None:
+                _ant_ang_sl = (sl_sr.get('ant_fan_params') or {}).get('angle')
+            
+            # 兼容两种格式
+            if 'ant' in sl_sr:
+                _ant_data2 = sl_sr.get('ant')
+                _pts2 = _ant_data2.get('points', []) if _ant_data2 else []
+                _dirs2 = _ant_data2.get('dirs', []) if _ant_data2 else []
+                _before2 = len(_pts2)
+                if _pts2:
+                    kp2, kd2 = _verify_ant_pts_forward(
+                        _pts2, _dirs2, in_img_2d, pixel_spacing, _hm2, forward_mm=5.0,
+                        ant_angle_deg=_ant_ang_sl)
+                    sl_sr['ant'] = {'points': kp2, 'dirs': kd2}
+            else:
+                _pts2 = sl_sr.get('ant_pts', [])
+                _dirs2 = sl_sr.get('ant_dirs', [])
+                _before2 = len(_pts2)
+                if _pts2:
+                    kp2, kd2 = _verify_ant_pts_forward(
+                        _pts2, _dirs2, in_img_2d, pixel_spacing, _hm2, forward_mm=5.0,
+                        ant_angle_deg=_ant_ang_sl)
+                    sl_sr['ant_pts'] = kp2
+                    sl_sr['ant_dirs'] = kd2
+            
+            _after2 = len(sl_sr.get('ant', {}).get('points', [])) if 'ant' in sl_sr else len(sl_sr.get('ant_pts', []))
+            print(f"   [Step4c] 倒数第二椎体前缘二次校验: {_before2} → {_after2} 点保留")
+        else:
+            print(f"   [Step4c] 倒数第二椎体夹角={second_last_junc_angle_deg:.1f}° ≥ 65°，跳过前缘二次校验")
+
+    # Step5: 聚类
+    print("\n── Step5: 扇形聚类 ──")
+    cluster_results = cluster_all_vertebrae(
+        scan_results, disc_centers, pixel_spacing,
+        junction_pts=junction_pts,
+        c3_cols=v9_data.get('c3_cols'),
+        c3_rows=v9_data.get('c3_rows'),
+        arc_len_mm=v9_data.get('arc_len_mm'),
+        last_ant_angle_deg=angle_last,
+        second_last_ant_angle_deg=angle_2nd,
+        c2_rows=c2_rows_mode4,
+        c2_cols=c2_cols_mode4)
+
+    # Step6: 椎体链路
+    print("\n── Step6: 椎体链路 ──")
+    vertebra_chain, ant_line = build_vertebra_chain(
+        cluster_results, vert_centers, c2_rows_mode4, c2_cols_mode4,
+        pixel_spacing, img_shape=(H_in, W_in),
+        c2_rows=c2_rows_mode4, c2_cols=c2_cols_mode4,
+        junction_pts=junction_pts, disc_centers=disc_centers)
+
+    # 统计
+    n_complete = sum(
+        1 for e in vertebra_chain
+        if all(e['quad'].get(k) is not None
+               for k in ('sup_ant', 'sup_post', 'inf_ant', 'inf_post')))
+    print(f"\n   完整识别={n_complete}")
+
+    # ── 输出 ──
+    print("\n── 输出 ──")
+
+    # 1. 掩膜（S2 不保留）
+    from output.mask_export import export_masks as _export_masks, export_roi_zip as _export_roi_zip
+    # 快速模式：临时屏蔽 export_roi_zip，只输出 seg.nii.gz
+    if fast_mode:
+        import numpy as _np_roi
+        from skimage.draw import polygon as _poly
+        from skimage import measure as _measure_roi
+        # 直接调用不含ROI的掩膜导出（复用 export_masks 但跳过 ROI 部分）
+        # 通过在 mask_export 模块层面临时 patch
+        import output.mask_export as _me
+        _orig_roi = _me.export_roi_zip
+        _me.export_roi_zip = lambda *a, **kw: None  # 临时禁用
+        try:
+            _export_masks(vertebra_chain, (H_in, W_in), output_dir, stem,
+                         pixel_spacing, orig_affine=None, cord_mask_cut=cord_mask_cut,
+                         ant_line=ant_line, c1_rows=c2_rows_mode4, c1_cols=c2_cols_mode4)
+        finally:
+            _me.export_roi_zip = _orig_roi  # 还原
+    else:
+        _export_masks(vertebra_chain, (H_in, W_in), output_dir, stem,
+                     pixel_spacing, orig_affine=None, cord_mask_cut=cord_mask_cut,
+                     ant_line=ant_line, c1_rows=c2_rows_mode4, c1_cols=c2_cols_mode4)
+
+    # 2. CSV（全量和快速模式都输出）
+    export_csv(vertebra_chain, (H_in, W_in), output_dir, stem,
+               pixel_spacing, cord_mask_cut=cord_mask_cut,
+               best_slice_idx=best_slice_idx)
+
+    # 3. 可视化：快速模式只输出左图（W图链路）
+    visualize_wifs(
+        w_img_2d    = slice_2d,
+        in_img_2d   = in_img_2d,
+        vertebrae_chain = vertebra_chain,
+        ant_line    = ant_line,
+        cord_mask_cut   = cord_mask_cut,
+        output_dir  = output_dir,
+        stem        = stem,
+        pixel_spacing   = pixel_spacing,
+        c1_rows     = c1_rows_ext,
+        c1_cols     = c1_cols_ext,
+        c2_rows     = c2_rows_mode4,
+        c2_cols     = c2_cols_mode4,
+        junction_pts    = junction_pts,
+        disc_centers    = disc_centers,
+        vert_centers    = vert_centers,
+        patient_label   = f"{patient_name}/{seq_dir_name}",
+        in_label        = f"{patient_name}/{Path(in_nii_path).parent.name}" if in_nii_path else '',
+        left_only       = fast_mode,
+        scan_results    = scan_results,
+        cluster_results = cluster_results,
+        fan_params_list = fan_params_list,
+        profile_pts     = profile_pts,
+    )
+
+    # 4. 日志在 process_single 中写出（此处 stem 返回供外层使用）
+
+    return {
         'status': 'success',
-        'log_output': log_lines  # 使用列表形式
+        'stem': stem,
+        'n_vertebrae': n_complete,
+        'n_vertebrae_detected': len(vertebra_chain),
     }
-    
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(log_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"   [V14_2] 日志已保存：{os.path.basename(json_path)}")
-    
-    print(f"\n✅ 测试完成！")
-    print(f"📁 输出文件：{output_path}")
 
 
-# ============ 批量处理 ============
-def process_batch(parent_dir, output_dir):
-    """批量处理多个目录"""
-    os.makedirs(output_dir, exist_ok=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# _collect_w_series：预扫描匹配的 T2 Dixon W 序列
+# ─────────────────────────────────────────────────────────────────────────────
 
-    all_cases = []
-
-    for root, dirs, files in os.walk(parent_dir):
-        nifti_path    = os.path.join(root, 'scan.nii.gz')
-        metadata_path = os.path.join(root, 'metadata.json')
-        if not os.path.exists(nifti_path):
+def _collect_w_series(input_dir):
+    """
+    遍历 input_dir 下所有 scan.nii.gz，收集符合条件的 T2 Dixon W 序列。
+    返回 [(nii_path, meta_path, patient_dir, seq_dir), ...]，按路径排序。
+    """
+    cases = []
+    for nii_path in sorted(Path(input_dir).rglob('scan.nii.gz')):
+        seq_dir_obj     = nii_path.parent
+        patient_dir_obj = seq_dir_obj.parent
+        meta_path = seq_dir_obj / 'metadata.json'
+        if not meta_path.exists():
             continue
-        # 从 metadata 校验必须是 T2 Dixon W 序列
-        if os.path.exists(metadata_path):
-            try:
-                with open(metadata_path, 'r') as fp:
-                    m = json.load(fp)
-                desc   = m.get('series_info', {}).get('series_description', '')
-                s_type = _get_series_type(desc)
-                if s_type != 'W':
-                    continue  # 不是W(压脂)序列
-                if 't2' not in desc.lower() or 'dixon' not in desc.lower():
-                    continue  # 不是T2 Dixon序列
-            except:
-                continue  # metadata无法解析，跳过
+        try:
+            with open(meta_path) as fp:
+                m = json.load(fp)
+            desc = m.get('series_info', {}).get('series_description', '')
+            if not ('t2' in desc.lower() and _is_dixon_sequence(desc)
+                    and _get_series_type(desc) == 'W'):
+                continue
+        except Exception:
+            continue
+        cases.append((nii_path, meta_path, patient_dir_obj, seq_dir_obj))
+    return cases
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# process_batch：批量处理（全量模式，模式2）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_batch(input_dir, output_dir):
+    """
+    批量处理 input_dir 下所有病例（全量分割模式）。
+
+    输出：
+        output_dir/{patient}_{seq}/ 目录下各自的四种输出文件
+        output_dir/batch_summary.json  批量处理摘要
+    """
+    input_dir  = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    import time as _time
+
+    # 预扫描并显示总数
+    cases = _collect_w_series(input_dir)
+    n_total = len(cases)
+    print(f"\n🗂  批量处理: {input_dir}")
+    print(f"   共找到 {n_total} 个匹配病例（T2 Dixon W 序列）")
+    if n_total == 0:
+        print("   ⚠️  未找到匹配病例，退出")
+        return []
+
+    summary = []
+    success = 0; failed = 0
+    total_n_vert = 0
+    batch_start = _time.time()
+    batch_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    for idx, (nii_path, meta_path, patient_dir_obj, seq_dir_obj) in enumerate(cases, 1):
+        case_output = output_dir / f"{patient_dir_obj.name}_{seq_dir_obj.name}"
+        case_output.mkdir(parents=True, exist_ok=True)
+
+        case_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n[{idx}/{n_total}] {patient_dir_obj.name}/{seq_dir_obj.name}")
+        case_start = _time.time()
+        res = process_single(
+            str(nii_path), str(meta_path), str(case_output),
+            patient_dir=str(patient_dir_obj),
+            seq_dir=str(seq_dir_obj))
+        case_elapsed = round(_time.time() - case_start, 2)
+
+        n_vert = res.get('n_vertebrae', 0)
+        total_n_vert += n_vert
+
+        if res.get('status') == 'success':
+            success += 1
         else:
-            continue  # 没有metadata就无法校验，跳过
-        patient_dir_name = os.path.basename(os.path.dirname(root))
-        seq_dir_name     = os.path.basename(root)
-        all_cases.append((patient_dir_name, seq_dir_name, nifti_path, metadata_path))
+            failed += 1
 
-    print(f"📂 找到 {len(all_cases)} 个T2 Dixon W序列")
+        summary.append({
+            'patient':     patient_dir_obj.name,
+            'seq':         seq_dir_obj.name,
+            'start_time':  case_start_time,
+            'status':      res.get('status'),
+            'n_vertebrae': n_vert,
+            'elapsed_s':   case_elapsed,
+        })
 
-    for i, (patient_dir, seq_dir, nifti_path, metadata_path) in enumerate(all_cases):
-        print(f"\n[{i+1}/{len(all_cases)}] 处理: {patient_dir}/{seq_dir}")
-        test_single_image(nifti_path, metadata_path, output_dir, patient_dir, seq_dir)
+    batch_elapsed = round(_time.time() - batch_start, 2)
+    avg_elapsed   = round(batch_elapsed / n_total, 2) if n_total > 0 else 0.0
+
+    header = {
+        'batch_start_time': batch_start_time,
+        'batch_end_time':   datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total_cases':     n_total,
+        'success':         success,
+        'failed':          failed,
+        'total_vertebrae': total_n_vert,
+        'total_elapsed_s': batch_elapsed,
+        'avg_elapsed_s':   avg_elapsed,
+    }
+
+    summary_path = output_dir / 'batch_summary.json'
+    with open(summary_path, 'w', encoding='utf-8') as fp:
+        json.dump({**header, 'cases': summary}, fp, ensure_ascii=False, indent=2)
+
+    print(f"\n✅ 批量处理完成: total={n_total}  success={success}  failed={failed}")
+    print(f"   识别椎体总数={total_n_vert}  用时={batch_elapsed}s  平均={avg_elapsed}s/case")
+    print(f"   摘要: {summary_path}")
+    return summary
 
 
-# ============ 主函数 ============
+# ─────────────────────────────────────────────────────────────────────────────
+# process_batch_fast：批量快速轻量处理（模式3）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_batch_fast(input_dir, output_dir):
+    """
+    批量快速轻量处理（模式3）：
+      - 输出：掩膜（seg.nii.gz）+ CSV + 左图可视化（vis.png）
+      - 跳过：ROI ZIP、单例日志
+      - 保留：全局 batch_summary.json
+    """
+    input_dir  = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    import time as _time
+
+    # 预扫描并显示总数
+    cases = _collect_w_series(input_dir)
+    n_total = len(cases)
+    print(f"\n🗂  批量快速处理 (模式3): {input_dir}")
+    print(f"   共找到 {n_total} 个匹配病例（T2 Dixon W 序列）")
+    if n_total == 0:
+        print("   ⚠️  未找到匹配病例，退出")
+        return []
+
+    summary = []
+    success = 0; failed = 0
+    total_n_vert = 0
+    batch_start = _time.time()
+    batch_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    for idx, (nii_path, meta_path, patient_dir_obj, seq_dir_obj) in enumerate(cases, 1):
+        case_output = output_dir / f"{patient_dir_obj.name}_{seq_dir_obj.name}"
+        case_output.mkdir(parents=True, exist_ok=True)
+
+        case_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n[{idx}/{n_total}] {patient_dir_obj.name}/{seq_dir_obj.name}")
+        case_start = _time.time()
+        res = process_single(
+            str(nii_path), str(meta_path), str(case_output),
+            patient_dir=str(patient_dir_obj),
+            seq_dir=str(seq_dir_obj),
+            fast_mode=True)
+        case_elapsed = round(_time.time() - case_start, 2)
+
+        n_vert = res.get('n_vertebrae', 0)
+        total_n_vert += n_vert
+
+        if res.get('status') == 'success':
+            success += 1
+        else:
+            failed += 1
+
+        summary.append({
+            'patient':     patient_dir_obj.name,
+            'seq':         seq_dir_obj.name,
+            'start_time':  case_start_time,
+            'status':      res.get('status'),
+            'n_vertebrae': n_vert,
+            'elapsed_s':   case_elapsed,
+        })
+
+    batch_elapsed = round(_time.time() - batch_start, 2)
+    avg_elapsed   = round(batch_elapsed / n_total, 2) if n_total > 0 else 0.0
+
+    header = {
+        'mode':             'fast',
+        'batch_start_time': batch_start_time,
+        'batch_end_time':   datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total_cases':     n_total,
+        'success':         success,
+        'failed':          failed,
+        'total_vertebrae': total_n_vert,
+        'total_elapsed_s': batch_elapsed,
+        'avg_elapsed_s':   avg_elapsed,
+    }
+
+    summary_path = output_dir / 'batch_summary.json'
+    with open(summary_path, 'w', encoding='utf-8') as fp:
+        json.dump({**header, 'cases': summary}, fp, ensure_ascii=False, indent=2)
+
+    print(f"\n✅ 批量快速处理完成: total={n_total}  success={success}  failed={failed}")
+    print(f"   识别椎体总数={total_n_vert}  用时={batch_elapsed}s  平均={avg_elapsed}s/case")
+    print(f"   摘要: {summary_path}")
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI 入口
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    print("="*80)
-    print("椎管分割与终板检测 - V14_2 版本（多掩模拼接增强 + 平行扫描线 + 终板暗线）")
-    print("="*80)
-    print("\n可选模式:")
-    print("  1. 单张图像测试")
-    print("  2. 批量处理")
+    print("=" * 60)
+    print("LSMATools_WIFS – 腰椎 WATER/IN 序列膜态分割工具")
+    print("=" * 60)
+    print("\n请选择处理模式:")
+    print("  1. 单张图像处理")
+    print("  2. 批量处理（全量分割模式：掩膜+CSV+日志+ROI+W/I双图可视化）")
+    print("  3. 批量处理（快速轻量模式：掩膜+CSV+W图可视化，无ROI/单例日志）")
     print()
-    
-    mode = input("请选择模式 (1/2): ").strip()
-    
+
+    mode = input("模式选择 (1/2/3): ").strip()
+
     if mode == '1':
-        input_path = input("请输入图像文件或目录路径: ").strip()
-        
+        # ── 二级：单张 ──
+        input_path = input("\n请输入图像路径（scan.nii.gz 或序列目录）: ").strip()
+
         if os.path.isdir(input_path):
-            nifti_path = os.path.join(input_path, "scan.nii.gz")
-            metadata_path = os.path.join(input_path, "metadata.json")
-            print(f"   📁 检测到目录，自动使用: {nifti_path}")
+            nifti_path    = os.path.join(input_path, 'scan.nii.gz')
+            metadata_path = os.path.join(input_path, 'metadata.json')
+            print(f"   检测到目录，自动使用: {nifti_path}")
         else:
-            nifti_path = input_path
-            metadata_path = os.path.join(os.path.dirname(nifti_path), "metadata.json")
-        
+            nifti_path    = input_path
+            metadata_path = os.path.join(os.path.dirname(nifti_path), 'metadata.json')
+
         if not os.path.exists(nifti_path):
             print(f"❌ 文件不存在: {nifti_path}")
             return
-        
+
         if not os.path.exists(metadata_path):
             metadata_path = None
-            print("   ⚠️ 未找到metadata.json，使用默认像素间距0.9375mm")
-        
-        output_dir = input("请输入输出目录 (直接回车默认为./test_output): ").strip()
+            print("   ⚠️  未找到 metadata.json，使用默认像素间距 0.9375mm")
+
+        output_dir = input("请输入输出目录 (直接回车默认 ./wifs_output): ").strip()
         if not output_dir:
-            output_dir = "./test_output"
-        
-        test_single_image(nifti_path, metadata_path, output_dir)
-    
+            output_dir = "./wifs_output"
+
+        result = process_single(nifti_path, metadata_path=metadata_path,
+                                output_dir=output_dir)
+        print(f"\n结果: {result}")
+
     elif mode == '2':
-        parent_dir = input("请输入父目录路径: ").strip()
-        if not parent_dir:
-            parent_dir = "."
-            
-        output_dir = "/Users/mac/mri_lumbarpv/lumbar_roitest/batch_lsmatools_output"
-        print(f"📁 输出目录：{output_dir}")
-        process_batch(parent_dir, output_dir)
-    
+        # ── 二级：批量全量 ──
+        input_dir = input("\n请输入输入根目录: ").strip()
+        if not input_dir:
+            print("❌ 输入目录不能为空")
+            return
+
+        if not os.path.isdir(input_dir):
+            print(f"❌ 目录不存在: {input_dir}")
+            return
+
+        output_dir = input("请输入输出根目录 (直接回车默认 ./wifs_batch_output): ").strip()
+        if not output_dir:
+            output_dir = "./wifs_batch_output"
+
+        process_batch(input_dir, output_dir)
+
+    elif mode == '3':
+        # ── 二级：批量快速轻量 ──
+        input_dir = input("\n请输入输入根目录: ").strip()
+        if not input_dir:
+            print("❌ 输入目录不能为空")
+            return
+
+        if not os.path.isdir(input_dir):
+            print(f"❌ 目录不存在: {input_dir}")
+            return
+
+        output_dir = input("请输入输出根目录 (直接回车默认 ./wifs_batch_fast_output): ").strip()
+        if not output_dir:
+            output_dir = "./wifs_batch_fast_output"
+
+        process_batch_fast(input_dir, output_dir)
+
     else:
-        print("❌ 无效选择")
+        print("❌ 无效选择，请输入 1、2 或 3")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

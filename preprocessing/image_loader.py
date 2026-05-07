@@ -1,18 +1,20 @@
 """
 图像加载模块
-提供 NIfTI 文件加载和压水/压脂图像配对功能
+提供 NIfTI 文件加载和 W/IN 序列查找功能
 """
 import json
 import numpy as np
 import nibabel as nib
 from pathlib import Path
 
-from .series_utils import _get_series_type, _get_series_prefix, _get_series_number
+from .series_utils import (
+    _get_series_type, _get_series_prefix, _get_series_number, _is_dixon_sequence
+)
 
 
 def load_nifti(nifti_path: str, slice_idx: int = None):
     """
-    加载 NIfTI 文件，返回 (data_3d, img_2d, pixel_spacing)。
+    加载 NIfTI 文件，返回 (data_3d, affine, header, img_2d, pixel_spacing)。
 
     参数：
         nifti_path  - .nii.gz 文件路径
@@ -20,11 +22,16 @@ def load_nifti(nifti_path: str, slice_idx: int = None):
 
     返回：
         data        - 3D numpy 数组 shape=(H,W,N)
+        affine      - NIfTI affine 矩阵
+        header      - NIfTI header 对象
         img_2d      - 选定切片的 2D float32 数组
         pixel_spacing - 像素间距（mm），从同目录 metadata.json 读取，默认 0.9375
     """
-    data  = nib.load(nifti_path).get_fdata()
-    n_sl  = data.shape[2]
+    img_obj = nib.load(nifti_path)
+    data    = img_obj.get_fdata()
+    affine  = img_obj.affine
+    header  = img_obj.header
+    n_sl    = data.shape[2]
     if slice_idx is None:
         slice_idx = n_sl // 2
     slice_idx = max(0, min(slice_idx, n_sl - 1))
@@ -40,22 +47,26 @@ def load_nifti(nifti_path: str, slice_idx: int = None):
         sp  = acq.get('pixel_spacing_mm', pixel_spacing)
         pixel_spacing = float(sp[0]) if isinstance(sp, list) else float(sp)
 
-    return data, img_2d, pixel_spacing
+    return data, affine, header, img_2d, pixel_spacing
 
 
-def find_fat_water_image(w_nii_path: str, slice_idx: int = None):
+def find_in_image(w_nii_path: str, slice_idx: int = None):
     """
-    根据压脂图路径，在同一患者目录下找到最佳配对的压水图（F 序列）。
+    根据压脂图（W序列）路径，在同一患者目录下找到最佳配对的 IN（in-phase）序列。
 
-    配对规则：
-      1. 从 metadata series_description 最后一个'_'之后字符判断类型(W/F)
-      2. 必须是 T2 Dixon 序列（series_description 同时含 't2' 和 'dixon'，不区分大小写）
-      3. 患者 ID 交叉校验（metadata patient_id 一致）
-      4. 同前缀优先（series_description 去掉末尾 _W/_F 后的前缀相同）
-      5. 多对同前缀时，按 series number 差值最小的 F 与当前 W 配对
+    配对规则（三级排序）：
+      1. imagepositionpatient 精确匹配优先（三分量差值均 < 1mm → 0，否则 1）
+         ── 同一次采集的 W/IN/OPP/F 四个序列 imagepositionpatient 完全相同，
+            可精确区分同目录下两组 Dixon 序列
+      2. 同前缀次之（series_description 去掉末尾 _W/_IN 后的前缀相同 → 0）
+      3. series number 差值最小兜底
+
+    其他条件：
+      - 必须是 T2 Dixon/WFI 序列
+      - 患者 ID 交叉校验
 
     返回：
-        (f_img_2d, f_meta, f_nii_path) 或 (None, None, None)
+        (in_img_2d, in_meta, in_nii_path) 或 (None, None, None)
     """
     w_path      = Path(w_nii_path)
     seq_dir     = w_path.parent
@@ -71,8 +82,9 @@ def find_fat_water_image(w_nii_path: str, slice_idx: int = None):
     w_desc    = w_meta.get('series_info', {}).get('series_description', '')
     w_prefix  = _get_series_prefix(w_desc)
     w_ser_num = _get_series_number(seq_dir.name)
+    w_pos     = w_meta.get('sampling_parameters', {}).get('imagepositionpatient', None)
 
-    print(f"\n搜索压水图(F序列): {patient_dir}")
+    print(f"\n搜索IN序列: {patient_dir}")
     print(f"   压脂图: folder={seq_dir.name}, series='{w_desc}', "
           f"prefix='{w_prefix}', ser_num={w_ser_num}, pid='{w_pid}'")
 
@@ -85,46 +97,57 @@ def find_fat_water_image(w_nii_path: str, slice_idx: int = None):
         if not meta_path.exists() or not nii_path.exists():
             continue
         with open(meta_path, 'r') as fp:
-            f_meta = json.load(fp)
+            in_meta = json.load(fp)
 
-        f_desc    = f_meta.get('series_info', {}).get('series_description', '')
-        f_pid     = f_meta.get('patient_info', {}).get('patient_id', '')
-        f_type    = _get_series_type(f_desc)
-        f_prefix  = _get_series_prefix(f_desc)
-        f_ser_num = _get_series_number(d.name)
+        in_desc    = in_meta.get('series_info', {}).get('series_description', '')
+        in_pid     = in_meta.get('patient_info', {}).get('patient_id', '')
+        in_type    = _get_series_type(in_desc)
+        in_prefix  = _get_series_prefix(in_desc)
+        in_ser_num = _get_series_number(d.name)
 
-        if f_type != 'F':
+        # 接受 IN 类型或后缀含 'in'/'ip' 的序列（联影设备用 IP 表示 in-phase）
+        is_in_type = (in_type == 'IN') or ('_in' in in_desc.lower().split('_')[-1:])
+        # 更宽松的 IN/IP 匹配：序列名末尾含 'in' 或 'ip'
+        if in_desc and in_desc.rsplit('_', 1)[-1].lower() in ('in', 'inphase', 'in_phase', 'ip'):
+            is_in_type = True
+
+        if not is_in_type:
             continue
-        if 't2' not in f_desc.lower() or 'dixon' not in f_desc.lower():
-            print(f"   跳过 {d.name}: series='{f_desc}' 不是T2 Dixon序列")
+        if 't2' not in in_desc.lower() or not _is_dixon_sequence(in_desc):
+            print(f"   跳过 {d.name}: series='{in_desc}' 不是T2 Dixon/WFI序列")
             continue
-        if w_pid and f_pid and w_pid != f_pid:
-            print(f"   跳过 {d.name}: 患者ID不匹配 ({f_pid} != {w_pid})")
+        if w_pid and in_pid and w_pid != in_pid:
+            print(f"   跳过 {d.name}: 患者ID不匹配 ({in_pid} != {w_pid})")
             continue
 
-        prefix_match = 0 if f_prefix == w_prefix else 1
-        ser_diff     = abs(f_ser_num - w_ser_num)
-        candidates.append((prefix_match, ser_diff, d, f_meta, str(nii_path)))
-        print(f"   候选 {d.name}: series='{f_desc}', "
-              f"prefix_match={prefix_match==0}, ser_diff={ser_diff}")
+        # 计算 imagepositionpatient 精确匹配（三分量差值均 < 1mm）
+        in_pos = in_meta.get('sampling_parameters', {}).get('imagepositionpatient', None)
+        if w_pos and in_pos and len(w_pos) == 3 and len(in_pos) == 3:
+            pos_exact = 0 if all(abs(w_pos[i] - in_pos[i]) < 1.0 for i in range(3)) else 1
+        else:
+            pos_exact = 1  # 无位置信息时不按此项优先
+
+        prefix_match = 0 if in_prefix == w_prefix else 1
+        ser_diff     = abs(in_ser_num - w_ser_num)
+        candidates.append((pos_exact, prefix_match, ser_diff, d, in_meta, str(nii_path)))
+        print(f"   候选 {d.name}: series='{in_desc}', "
+              f"pos_exact={pos_exact == 0}, prefix_match={prefix_match == 0}, ser_diff={ser_diff}")
 
     if not candidates:
-        print("   [WARN] 未找到压水图F序列")
+        print("   [WARN] 未找到IN序列")
         return None, None, None
 
-    candidates.sort(key=lambda x: (x[0], x[1]))
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
     best = candidates[0]
-    d_best, f_meta_best, nii_best = best[2], best[3], best[4]
-    print(f"   [OK] 最优配对压水图: {d_best.name} "
-          f"(prefix_match={best[0]==0}, ser_diff={best[1]})")
+    d_best, in_meta_best, nii_best = best[3], best[4], best[5]
+    print(f"   [OK] 最优配对IN序列: {d_best.name} "
+          f"(pos_exact={best[0] == 0}, prefix_match={best[1] == 0}, ser_diff={best[2]})")
 
-    f_img  = nib.load(nii_best).get_fdata()
-    n_f    = f_img.shape[2]
-    if slice_idx is not None and 0 <= slice_idx < n_f:
+    in_img  = nib.load(nii_best).get_fdata()
+    n_in    = in_img.shape[2]
+    if slice_idx is not None and 0 <= slice_idx < n_in:
         use_idx = slice_idx
-        print(f"   压水图使用传入切片索引={use_idx}")
     else:
-        use_idx = n_f // 2
-        print(f"   压水图退回默认中间切片索引={use_idx}")
-    f_img_2d = f_img[:, :, use_idx].astype(np.float32)
-    return f_img_2d, f_meta_best, nii_best
+        use_idx = n_in // 2
+    in_img_2d = in_img[:, :, use_idx].astype(np.float32)
+    return in_img_2d, in_meta_best, nii_best
