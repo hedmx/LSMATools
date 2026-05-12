@@ -1,8 +1,8 @@
 # LSMATOOLS 架构设计文档
 
-> **版本**：V15.5  
-> **更新日期**：2026-05-07  
-> **输入序列**：西门子 T2 Dixon（W 水相 + IN 同相位）或 联影 T2 WFI（W 水相 + IP 同相位）
+> **版本**：V15.6  
+> **更新日期**：2026-05-12  
+> **输入序列**：西门子 T2 Dixon（W + IN）| 联影 T2 WFI（W + IP）| GE Flex/IDEAL（WATER + T2 fallback）
 
 ---
 
