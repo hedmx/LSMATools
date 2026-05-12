@@ -165,16 +165,25 @@ def process_single(nifti_path, metadata_path=None, output_dir=None,
         print(f"\n[FATAL] 处理异常: {exc}")
         traceback.print_exc()
         result = {'status': 'failed', 'error': str(exc), 'n_vertebrae': 0}
+        if not result.get('stem'):
+            try:
+                p = Path(nifti_path)
+                result['stem'] = f"{p.parent.parent.name}_{p.parent.name}"
+            except Exception:
+                result['stem'] = f"crash_{os.path.basename(nifti_path).replace('.nii.gz', '')}"
     finally:
         sys.stdout = original_stdout
 
     log_content = log_capture.getvalue()
-    # 所有模式均保存完整日志到文件（失败案例必须可追溯）
-    if output_dir and result.get('stem'):
+    if output_dir:
+        stem = result.get('stem')
+        if not stem:
+            stem = f"crash_{datetime.now().strftime('%H%M%S')}"
+            result['stem'] = stem
         try:
-            export_log(log_content, output_dir, result['stem'])
-        except Exception:
-            pass
+            export_log(log_content, output_dir, stem)
+        except Exception as log_exc:
+            print(f"[log] 日志保存失败: {log_exc}", file=sys.stderr)
 
     # 终端仅输出保存记录和错误信息（其余分割日志只在文件中）
     _filtered_lines = []
@@ -310,11 +319,22 @@ def _run_single(nifti_path, metadata_path, output_dir,
 
     # Step2
     print("\n── Step2: 终板汇合点扫描 ──")
-    junction_pts, anchor_pts_list = scan_endplate_junction_points(
-        in_img_2d, c2_rows_mode4, c2_cols_mode4,
-        pixel_spacing, low_mean)
+    junction_pts = []
+    anchor_pts_list = []
+    for pass_i, (off_start, off_end) in enumerate(
+            [(1.0, 3.0), (3.0, 5.0), (5.0, 7.0)]):
+        if pass_i > 0:
+            print(f"   [Pass{pass_i+1}] offset{off_start:.0f}→{off_end:.0f}mm 重试...")
+        junction_pts, anchor_pts_list = scan_endplate_junction_points(
+            in_img_2d, c2_rows_mode4, c2_cols_mode4,
+            pixel_spacing, low_mean,
+            offset_start_mm=off_start, offset_end_mm=off_end)
+        if len(junction_pts) >= 2:
+            break
+        print(f"   [Pass{pass_i+1}] 仅找到 {len(junction_pts)} 个汇合点，offset不足")
+
     if len(junction_pts) < 2:
-        print("   ❌ 终板汇合点不足2个，跳过mode4")
+        print("   ❌ 终板汇合点不足2个（三pass均失败），跳过mode4")
         return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
 
     # Step2b
@@ -446,9 +466,9 @@ def _run_single(nifti_path, metadata_path, output_dir,
                 drop_ratio=_ant_drop, low_ratio=1.3, scan_fn=_ant_scan_fn)
             
             sr = {
-                'sup': {'points': _sup_pts} if _sup_pts else None,
-                'inf': {'points': _inf_pts} if _inf_pts else None,
-                'ant': {'points': ant_pts, 'dirs': ant_dirs} if ant_pts else None,
+                'sup': {'points': _sup_pts} if _sup_pts else {'points': []},
+                'inf': {'points': _inf_pts} if _inf_pts else {'points': []},
+                'ant': {'points': ant_pts, 'dirs': ant_dirs} if ant_pts else {'points': [], 'dirs': []},
                 'fan_params': None,
                 'ant_fan_params': {
                     'center': (float(vc[0]), float(vc[1])),
@@ -519,7 +539,7 @@ def _run_single(nifti_path, metadata_path, output_dir,
                     last_sr['ant_pts'] = kept_pts
                     last_sr['ant_dirs'] = kept_dirs
             
-            _after = len(last_sr.get('ant', {}).get('points', [])) if 'ant' in last_sr else len(last_sr.get('ant_pts', []))
+            _after = len((last_sr.get('ant') or {}).get('points', [])) if 'ant' in last_sr else len(last_sr.get('ant_pts', []))
             print(f"   [Step4c] 最后椎体前缘二次校验: {_before} → {_after} 点保留")
         else:
             print(f"   [Step4c] 最后椎体夹角={last_junc_angle_deg:.1f}° ≥ 65°，跳过前缘二次校验")
@@ -559,7 +579,7 @@ def _run_single(nifti_path, metadata_path, output_dir,
                     sl_sr['ant_pts'] = kp2
                     sl_sr['ant_dirs'] = kd2
             
-            _after2 = len(sl_sr.get('ant', {}).get('points', [])) if 'ant' in sl_sr else len(sl_sr.get('ant_pts', []))
+            _after2 = len((sl_sr.get('ant') or {}).get('points', [])) if 'ant' in sl_sr else len(sl_sr.get('ant_pts', []))
             print(f"   [Step4c] 倒数第二椎体前缘二次校验: {_before2} → {_after2} 点保留")
         else:
             print(f"   [Step4c] 倒数第二椎体夹角={second_last_junc_angle_deg:.1f}° ≥ 65°，跳过前缘二次校验")

@@ -345,6 +345,71 @@ def _calc_c2_arc(c2r_arr, c2c_arr, pixel_spacing):
     return arc
 
 
+def _assess_naming_confidence(complete_for_naming, c2_rows, c2_cols, pixel_spacing):
+    """
+    评估椎体命名可靠性（三条件判定，≥2 个满足 → uncertain）。
+
+    条件A: 完整椎体数 ≤ 4
+      正常腰椎扫描覆盖 L1-L5 共 5 个椎体，≤4 说明 L5 可能不在视野。
+
+    条件B: 最后两个椎体上终板角均 < 20°
+      L5 上终板角通常在 15-30°，S1 在 30-55°。
+      若最后两个都 < 20°，说明尚未到达腰骶交界。
+
+    条件C: 皮质线尾部 15mm 内 col 向背侧偏移 < 5mm
+      椎管进入骶骨后向背侧走（col 增大）。若尾部 col 几乎不变，
+      说明未出现骶骨偏移特征，L5-S1 交界可能不在视野内。
+
+    返回: 'presumed_ok' | 'uncertain'
+    """
+    n = len(complete_for_naming)
+
+    # ── 条件A: 椎体数少 ──
+    cond_a = (n <= 4)
+
+    # ── 条件B: 尾部上终板角过低 ──
+    cond_b = False
+    _la = _sa = None
+    if n >= 2:
+        _la = complete_for_naming[-1].get('sup_angle_deg')
+        _sa = complete_for_naming[-2].get('sup_angle_deg')
+        if _la is not None and _sa is not None:
+            cond_b = (_la < 20.0 and _sa < 20.0)
+
+    # ── 条件C: 皮质线尾部无骶骨向背侧偏移 ──
+    cond_c = False
+    _col_shift = 0.0
+    if c2_cols is not None and len(c2_cols) >= 5:
+        tail_mm = 15.0
+        tail_px = int(tail_mm / pixel_spacing)
+        tail_n  = min(max(5, tail_px), len(c2_cols))
+        c2c = np.array(list(c2_cols)[-tail_n:], dtype=np.float64)
+        _col_shift = float(c2c[-1] - c2c[0])   # 正值=向背侧偏移
+        cond_c = (_col_shift < 5.0 / pixel_spacing)
+
+    flags    = [cond_a, cond_b, cond_c]
+    n_flags  = sum(flags)
+    result   = 'uncertain' if n_flags >= 2 else 'presumed_ok'
+
+    # ── 日志 ──
+    detail_parts = []
+    if cond_a:
+        detail_parts.append(f"A(n={n})")
+    if cond_b:
+        detail_parts.append(f"B(last={_la:.1f}° sec={_sa:.1f}°)")
+    if cond_c:
+        detail_parts.append(f"C(shift={_col_shift:.1f}px)")
+
+    print(f"   [命名置信度] "
+          f"A={'Y' if cond_a else 'N'} "
+          f"B={'Y' if cond_b else 'N'} "
+          f"C={'Y' if cond_c else 'N'} "
+          f"→ {n_flags}/3 → {result}"
+          + (f"  ({', '.join(detail_parts)})" if detail_parts else ""))
+
+    return result
+
+
 def build_vertebra_chain(cluster_results, vert_centers, c1_rows, c1_cols,
                           pixel_spacing, img_shape,
                           c2_rows=None, c2_cols=None,
@@ -676,6 +741,12 @@ def build_vertebra_chain(cluster_results, vert_centers, c1_rows, c1_cols,
         for i, entry in enumerate(reversed(complete_for_naming)):
             entry['name'] = bottom_seq[i] if i < len(bottom_seq) else f'T{10-i}'
 
+    # ── 命名置信度评估 ──
+    naming_conf = _assess_naming_confidence(
+        complete_for_naming, c2_rows, c2_cols, pixel_spacing)
+    for e in raw_chain:
+        e['naming_confidence'] = naming_conf
+
     # ── F'. 前缘线宽度校验与修正（仅 L/T 椎体，独立处理不影响其他椎体）──
     _can_width_check = (
         c2_rows is not None and c2_cols is not None and len(c2_rows) >= 2
@@ -812,5 +883,6 @@ def build_vertebra_chain(cluster_results, vert_centers, c1_rows, c1_cols,
     print(f"   [Step6链路] 检测椎体={n_total}  完整识别={n_complete}  "
           f"不完整={incomplete_names}  "
           f"前缘线={len(ant_line)}点  "
+          f"命名置信度={naming_conf}  "
           f"命名: {[e['name'] for e in raw_chain]}")
     return raw_chain, ant_line

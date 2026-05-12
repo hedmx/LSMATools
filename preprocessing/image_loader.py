@@ -120,28 +120,78 @@ def find_in_image(w_nii_path: str, slice_idx: int = None):
             print(f"   跳过 {d.name}: 患者ID不匹配 ({in_pid} != {w_pid})")
             continue
 
-        # 计算 imagepositionpatient 精确匹配（三分量差值均 < 1mm）
+        # 计算 imagepositionpatient 精确匹配
+        #   0=同位置, 1=无位置数据(允许), 2=有数据但位置不同(拒绝)
         in_pos = in_meta.get('sampling_parameters', {}).get('imagepositionpatient', None)
         if w_pos and in_pos and len(w_pos) == 3 and len(in_pos) == 3:
-            pos_exact = 0 if all(abs(w_pos[i] - in_pos[i]) < 1.0 for i in range(3)) else 1
+            pos_exact = 0 if all(abs(w_pos[i] - in_pos[i]) < 1.0 for i in range(3)) else 2
         else:
-            pos_exact = 1  # 无位置信息时不按此项优先
+            pos_exact = 1
 
         prefix_match = 0 if in_prefix == w_prefix else 1
         ser_diff     = abs(in_ser_num - w_ser_num)
         candidates.append((pos_exact, prefix_match, ser_diff, d, in_meta, str(nii_path)))
         print(f"   候选 {d.name}: series='{in_desc}', "
-              f"pos_exact={pos_exact == 0}, prefix_match={prefix_match == 0}, ser_diff={ser_diff}")
+              f"pos_exact={pos_exact}, prefix_match={prefix_match == 0}, ser_diff={ser_diff}")
 
     if not candidates:
+        # GE Flex fallback: 无标准IN时，查找同位置的非Dixon T2矢状位作为IN
+        ge_candidates = []
+        for d in sorted(patient_dir.iterdir()):
+            if not d.is_dir():
+                continue
+            meta_path = d / 'metadata.json'
+            nii_path = d / 'scan.nii.gz'
+            if not meta_path.exists() or not nii_path.exists():
+                continue
+            with open(meta_path, 'r') as fp:
+                ge_meta = json.load(fp)
+            ge_desc = ge_meta.get('series_info', {}).get('series_description', '').lower()
+            ge_pid = ge_meta.get('patient_info', {}).get('patient_id', '')
+            
+            # 必须: T2 + sagittal，排除自身(W序列)
+            if 't2' not in ge_desc or 'sag' not in ge_desc:
+                continue
+            if d.name == seq_dir.name:
+                continue
+            if w_pid and ge_pid and w_pid != ge_pid:
+                continue
+            
+            # 同位置检查
+            ge_pos = ge_meta.get('sampling_parameters', {}).get('imagepositionpatient', None)
+            if w_pos and ge_pos and len(w_pos) == 3 and len(ge_pos) == 3:
+                if not all(abs(w_pos[i] - ge_pos[i]) < 1.0 for i in range(3)):
+                    continue
+            else:
+                continue
+            
+            ge_ser = _get_series_number(d.name)
+            ge_candidates.append((abs(ge_ser - w_ser_num), d, ge_meta, str(nii_path)))
+            print(f"   [GE fallback] {d.name}: series='{ge_desc}' 同位置T2，候选IN替代")
+        
+        if ge_candidates:
+            ge_candidates.sort(key=lambda x: x[0])
+            _, d_ge, ge_meta_best, nii_ge = ge_candidates[0]
+            print(f"   [OK] GE fallback 最优替代IN: {d_ge.name} (ser_diff={ge_candidates[0][0]})")
+            in_img = nib.load(nii_ge).get_fdata()
+            n_in = in_img.shape[2]
+            use_idx = slice_idx if (slice_idx is not None and 0 <= slice_idx < n_in) else n_in // 2
+            return in_img[:, :, use_idx].astype(np.float32), ge_meta_best, nii_ge
+        
         print("   [WARN] 未找到IN序列")
         return None, None, None
 
     candidates.sort(key=lambda x: (x[0], x[1], x[2]))
     best = candidates[0]
+
+    if best[0] == 2:
+        print(f"   [WARN] 最佳候选 {best[3].name} 与压脂图位置不同 "
+              f"(pos_exact=2)，拒绝跨采集配对")
+        return None, None, None
+
     d_best, in_meta_best, nii_best = best[3], best[4], best[5]
     print(f"   [OK] 最优配对IN序列: {d_best.name} "
-          f"(pos_exact={best[0] == 0}, prefix_match={best[1] == 0}, ser_diff={best[2]})")
+          f"(pos_exact={best[0]}, prefix_match={best[1] == 0}, ser_diff={best[2]})")
 
     in_img  = nib.load(nii_best).get_fdata()
     n_in    = in_img.shape[2]

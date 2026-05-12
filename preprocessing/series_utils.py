@@ -7,18 +7,33 @@ import re
 
 def _get_series_type(series_desc: str):
     """
-    从 series_description 最后一个'_'之后的字符判断序列类型。
-    返回 'W'（压脂）/ 'F'（压水）/ 'IN'（in-phase）/ None
+    从 series_description 解析序列类型。
+    支持两种格式：
+      - 末尾格式: T2_TSE_DIXON_SAG_W → W / T2_fse_wfi_sag_Water → W
+      - 开头格式 (GE): WATER: Sag T2 FSE Flex → W / FAT: Sag T2 FSE Flex → F
+    返回 'W' / 'F' / 'IN' / None
     """
-    if not series_desc or '_' not in series_desc:
+    if not series_desc:
         return None
-    suffix = series_desc.rsplit('_', 1)[-1].upper()
-    if suffix in ('W', 'WATER'):
-        return 'W'
-    if suffix in ('F', 'FAT'):
-        return 'F'
-    if suffix in ('IN', 'INPHASE', 'IN_PHASE', 'IP'):
-        return 'IN'
+    desc_upper = series_desc.upper()
+    
+    # GE 开头格式: "WATER: ..." 或 "FAT: ..."
+    if ':' in desc_upper:
+        prefix = desc_upper.split(':', 1)[0].strip()
+        if prefix == 'WATER':
+            return 'W'
+        if prefix == 'FAT':
+            return 'F'
+    
+    # 标准末尾格式: ..._W 或 ..._WATER
+    if '_' in desc_upper:
+        suffix = desc_upper.rsplit('_', 1)[-1]
+        if suffix in ('W', 'WATER'):
+            return 'W'
+        if suffix in ('F', 'FAT'):
+            return 'F'
+        if suffix in ('IN', 'INPHASE', 'IN_PHASE', 'IP'):
+            return 'IN'
     return None
 
 
@@ -38,9 +53,10 @@ def _get_series_number(folder_name: str) -> int:
 def _is_dixon_sequence(series_desc: str) -> bool:
     """
     判断是否为 Dixon/WFI 序列（不区分大小写）。
-    兼容两种命名规范：
+    兼容三种命名规范：
       - 'dixon'：如 T2_TSE_DIXON_SAG_W
       - 'wfi'  ：如 T2_TSE_WFI_SAG_W
+      - 'flex' ：如 WATER: Sag T2 FSE Flex (GE)
     """
     d = series_desc.lower()
-    return 'dixon' in d or 'wfi' in d
+    return 'dixon' in d or 'wfi' in d or 'flex' in d

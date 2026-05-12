@@ -10,13 +10,14 @@ def scan_endplate_junction_points(in_img_2d, c2_rows, c2_cols,
                                    pixel_spacing, low_mean,
                                    win_h_mm=2.0, win_w_mm=2.0,
                                    low_ratio=0.8, smooth_win=3,
-                                   suppress_mm=8.0):
+                                   suppress_mm=8.0,
+                                   offset_start_mm=1.0, offset_end_mm=3.0):
     """
     沿皮质线2-2从顶向下逐点滑动（遍历基准改为c2，几何稳定性更高），
     滑动窗口切线/法线方向跟随皮质线2局部切线，
     窗口锚点为c2当前点沿法线腹侧偏移，偏移量分段线性渐变：
-      - 0%~60% 行程：offset 从 1mm 线性渐变到 3mm
-      - 60%~100% 行程：offset 固定 3mm
+      - 0%~60% 行程：offset 从 offset_start_mm 线性渐变到 offset_end_mm
+      - 60%~100% 行程：offset 固定 offset_end_mm
 
     返回：
         (junction_pts, anchor_pts_out)
@@ -45,9 +46,9 @@ def scan_endplate_junction_points(in_img_2d, c2_rows, c2_cols,
         t = float(np.clip((c2r[i] - r_min) / r_span, 0.0, 1.0))
         if t <= 0.6:
             frac = t / 0.6
-            offset_mm = 1.0 + frac * (3.0 - 1.0)
+            offset_mm = offset_start_mm + frac * (offset_end_mm - offset_start_mm)
         else:
-            offset_mm = 3.0
+            offset_mm = offset_end_mm
         offset_px = offset_mm / pixel_spacing
 
         _, _, n_row, n_col = _project_to_c2(
@@ -128,7 +129,7 @@ def scan_endplate_junction_points(in_img_2d, c2_rows, c2_cols,
 
     print(f"   [Step2] 皮质线2-2共{len(c2r)}点，"
           f"窗口{win_h_mm}×{win_w_mm}mm，静默{suppress_mm}mm，"
-          f"offset分段1→3mm，"
+          f"offset{offset_start_mm:.0f}→{offset_end_mm:.0f}mm，"
           f"找到终板汇合点 {len(junction_pts)} 个")
     for _i, _jp in enumerate(junction_pts):
         print(f"   [Step2] 点[{_i}] c2=({_jp[0]:.1f},{_jp[1]:.1f}) mean={_jp[2]:.1f}")

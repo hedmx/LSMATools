@@ -364,8 +364,8 @@ def cluster_all_vertebrae(scan_results, disc_centers, pixel_spacing,
     results = []
     for vi, sr in enumerate(scan_results):
         # 兼容两种格式：disc模式用 sr['sup']['points']，fan模式用 sr['sup_pts']
-        sup_pts = sr.get('sup', {}).get('points', []) if 'sup' in sr else sr.get('sup_pts', [])
-        inf_pts = sr.get('inf', {}).get('points', []) if 'inf' in sr else sr.get('inf_pts', [])
+        sup_pts = (sr.get('sup') or {}).get('points', []) if 'sup' in sr else sr.get('sup_pts', [])
+        inf_pts = (sr.get('inf') or {}).get('points', []) if 'inf' in sr else sr.get('inf_pts', [])
         
         if _use_arc:
             sup_raw = [(p[0], p[1], _arc_coord(p[0], p[1], c3_rows, c3_cols, arc_len_mm))
@@ -427,7 +427,7 @@ def cluster_all_vertebrae(scan_results, disc_centers, pixel_spacing,
 
         new_ant = None
         # 兼容两种格式
-        ant_pts = sr.get('ant', {}).get('points', []) if 'ant' in sr else sr.get('ant_pts', [])
+        ant_pts = (sr.get('ant') or {}).get('points', []) if 'ant' in sr else sr.get('ant_pts', [])
         disc_top = disc_centers[vi]     if vi     < len(disc_centers) else None
         disc_bot = disc_centers[vi + 1] if vi + 1 < len(disc_centers) else None
         

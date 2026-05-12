@@ -366,23 +366,26 @@ def _process_single_slice(data, h_img, w_img, idx, pixel_spacing):
     max_normal_width_px = int(round(MAX_CANAL_WIDTH_MM / pixel_spacing))
     abnormal_row_count = 0
     abnormal_rows_list = []
+    abnormal_row_widths = []
     for row in range(h_img):
         cols = np.where(green_mask[row, :])[0]
         if len(cols) > 0:
-            if cols[-1] - cols[0] + 1 > max_normal_width_px:
+            w = cols[-1] - cols[0] + 1
+            if w > max_normal_width_px:
                 abnormal_row_count += 1
                 abnormal_rows_list.append(row)
+                abnormal_row_widths.append(w)
     if abnormal_row_count >= 5:
         mask_rows_all = np.where(np.any(green_mask, axis=1))[0]
         if len(mask_rows_all) > 0:
             mask_top = mask_rows_all[0]
             mask_bottom = mask_rows_all[-1]
             mask_height = mask_bottom - mask_top + 1
-            # 死亡评分：异常行数 > 总掩膜行数的 30%，直接判 0
-            if abnormal_row_count / mask_height > 0.30:
+            # 死亡评分：异常行数 > 总掩膜行数的 20%，直接判 0
+            if abnormal_row_count / mask_height > 0.20:
                 width_valid = False
                 print(f"   ☠️ 切片 [第{idx+1}张] 死亡评分: "
-                      f"异常行{abnormal_row_count}/{mask_height}行 > 30%, 直接判0")
+                      f"异常行{abnormal_row_count}/{mask_height}行 > 20%, 直接判0")
             else:
                 threshold_60_row = mask_top + int(mask_height * 0.60)
                 abnormal_in_first60 = sum(1 for r in abnormal_rows_list if r <= threshold_60_row)
@@ -421,10 +424,12 @@ def _process_single_slice(data, h_img, w_img, idx, pixel_spacing):
                         print(f"   ⚠️ 切片 [第{idx+1}张] 宽度异常(无有效行宽): {abnormal_row_count}行")
                 else:
                     width_valid = False
-                    print(f"   ⚠️ 切片 [第{idx+1}张] 宽度异常(后40%): {abnormal_row_count}行超过30mm")
+                    print(f"   ⚠️ 切片 [第{idx+1}张] 宽度异常(后40%): "
+                          f"{abnormal_row_count}行超过{MAX_CANAL_WIDTH_MM:.0f}mm")
         else:
             width_valid = False
-            print(f"   ⚠️ 切片 [第{idx+1}张] 宽度异常: {abnormal_row_count}行超过30mm")
+            print(f"   ⚠️ 切片 [第{idx+1}张] 宽度异常: "
+                  f"{abnormal_row_count}行超过{MAX_CANAL_WIDTH_MM:.0f}mm")
 
     area_mm2 = green_area_px * (pixel_spacing ** 2)
     return {
@@ -436,6 +441,10 @@ def _process_single_slice(data, h_img, w_img, idx, pixel_spacing):
         'green_bottom_row': green_bottom_row,
         'width_valid': width_valid,
         'total_gap_px': total_gap_px,
+        'abnormal_row_count': abnormal_row_count,
+        'abnormal_row_widths': abnormal_row_widths,
+        'green_col_center': green_col_center,
+        'green_mask_width_px': green_width_px,
         'area_score': 0.0,
         'bottom_score': 0.0,
         'gap_score': 0.0,
@@ -459,7 +468,7 @@ def select_best_slice(data, pixel_spacing):
     【评分机制】（45% 面积 + 45% 底部 + 10% 空洞惩罚，均为相对评分）
       1. 面积评分：绿色掩模面积最大者得 1 分，其他按比例
       2. 底部位置评分：底行最低者得 1 分，其他按比例
-      宽度异常检测：异常行 > 30% 掩膜行数 → 死亡评分直接判 0；
+       宽度异常检测：异常行 > 20% 掩膜行数 → 死亡评分直接判 0；
                     否则 ≥5 行宽度超过 30mm → 前 60% 则修剪再评分，后 40% 则置零
       全零兜底：所有切片得 0 分时，选中间候选切片
 
@@ -491,6 +500,65 @@ def select_best_slice(data, pixel_spacing):
 
     # 计算相对评分（45% 面积 + 45% 底部 + 10% 空洞惩罚）
     if results:
+        # ── 宽度回退：≥3张异常时检查是否病灶性增宽 ──
+        invalid_count = sum(1 for r in results if not r.get('width_valid', True))
+        if invalid_count >= 3:
+            max_w_px = int(round(MAX_CANAL_WIDTH_MM / pixel_spacing))
+            all_widths = []
+            slice_medians = []
+            for r in results:
+                wlist = r.get('abnormal_row_widths', [])
+                if wlist:
+                    all_widths.extend(wlist)
+                    slice_medians.append(float(np.median(wlist)))
+
+            if all_widths and slice_medians:
+                avg_w = float(np.mean(all_widths))
+                ratio = avg_w / max_w_px
+
+                slices_gradual = True
+                if len(slice_medians) >= 2:
+                    diffs = np.abs(np.diff(slice_medians))
+                    slices_gradual = bool(np.all(diffs <= max_w_px * 0.5))
+
+                width_within_50pct = ratio <= 1.5
+
+                if slices_gradual and width_within_50pct:
+                    print(f"   🔄 宽度回退: {invalid_count}/{len(results)}张异常但连续渐变 "
+                          f"(avg={avg_w:.1f}px, ratio={ratio:.2f})，病灶性增宽，取消宽度惩罚")
+                    for r in results:
+                        r['width_valid'] = True
+                else:
+                    reason = []
+                    if not slices_gradual:
+                        reason.append("非渐变不连续")
+                    if not width_within_50pct:
+                        reason.append(f"平均宽比={ratio:.2f}>1.5")
+                    print(f"   ⚠️ 宽度回退未触发: {', '.join(reason)}")
+
+        # ── col中心共识：异常偏离的切片排除评分 ──
+        col_centers = []
+        col_widths = []
+        for r in results:
+            cc = r.get('green_col_center', 0)
+            cw = r.get('green_mask_width_px', 0)
+            if cc > 0 and cw > 0:
+                col_centers.append(cc)
+                col_widths.append(cw)
+
+        if len(col_centers) >= 3:
+            median_cc = float(np.median(col_centers))
+            median_cw = float(np.median(col_widths)) if col_widths else 30.0
+            col_threshold = max(median_cw * 0.5, 15.0 / pixel_spacing)
+
+            for r in results:
+                cc = r.get('green_col_center', 0)
+                if cc > 0 and abs(cc - median_cc) > col_threshold:
+                    if r.get('width_valid', True):
+                        print(f"   ⚠️ 切片 [第{r['slice_idx']+1}张] col偏移({cc:.0f}px)"
+                              f" vs 共识({median_cc:.0f}px) 偏差{abs(cc-median_cc):.0f}px > {col_threshold:.0f}px，排除评分")
+                        r['width_valid'] = False
+
         max_area = max(r['area_mm2'] for r in results)
         max_bottom_row = max(r['green_bottom_row'] for r in results)
         min_gap_px = min(r['total_gap_px'] for r in results)

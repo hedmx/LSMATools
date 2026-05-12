@@ -30,6 +30,7 @@ _FIELDNAMES = [
     'canal_ap_min_mm', 'canal_ap_min_row',
     'canal_ap_max_mm', 'canal_ap_center_mm',
     'canal_centroid_row', 'canal_centroid_col',
+    'naming_confidence',
 ]
 
 
@@ -79,6 +80,13 @@ def export_csv(vertebrae_chain, img_shape, output_dir, stem,
                 rr, cc = polygon(rows_poly, cols_poly, shape=img_shape)
                 vb_px_counts[name] = len(rr)
 
+    naming_conf_case = ''
+    for entry in (vertebrae_chain or []):
+        nc = entry.get('naming_confidence')
+        if nc:
+            naming_conf_case = nc
+            break
+
     for entry in (vertebrae_chain or []):
         name = entry.get('name', 'Inc')
         q = entry.get('quad', {})
@@ -107,6 +115,7 @@ def export_csv(vertebrae_chain, img_shape, output_dir, stem,
             'AP_bot_row_mm': _rmm(inf_ant), 'AP_bot_col_mm': _cmm(inf_ant),
             'BP_bot_row': _r(inf_post), 'BP_bot_col': _c(inf_post),
             'BP_bot_row_mm': _rmm(inf_post), 'BP_bot_col_mm': _cmm(inf_post),
+            'naming_confidence': entry.get('naming_confidence', ''),
         }
 
         if all(p is not None for p in (sup_ant, sup_post, inf_ant, inf_post)):
@@ -232,6 +241,7 @@ def export_csv(vertebrae_chain, img_shape, output_dir, stem,
             'canal_ap_center_mm': canal_ap_center_mm,
             'canal_centroid_row': canal_centroid_row,
             'canal_centroid_col': canal_centroid_col,
+            'naming_confidence': naming_conf_case,
         })
 
     if not rows_out:
