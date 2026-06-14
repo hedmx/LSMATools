@@ -296,11 +296,11 @@ def repair_junction_pts(junction_pts, anchor_pts_list,
             last_c2_idx = int(np.clip(int(out_jpts[-1][3]), 0, len(c2_cum) - 1))
             tail_remaining = c2_cum[-1] - c2_cum[last_c2_idx]
 
-            n_tail_floor = int(tail_remaining // tail_normal_gap)
+            n_tail_floor = max(1, int(tail_remaining // tail_normal_gap)) if tail_remaining >= tail_normal_gap * 0.6 else 0
             n_tail = min(4, n_tail_floor)
             if n_tail_floor == 0:
                 print(f"   [Step2b-末尾] tail_remaining={tail_remaining:.1f}px"
-                      f" < gap={tail_normal_gap:.1f}px，剩余不足一个间距，跳过补偿扫描")
+                      f" < gap×60%={tail_normal_gap*0.6:.1f}px，剩余不足，跳过补偿扫描")
 
             can_scan = (in_img_2d is not None and c2_rows_scan is not None
                         and c2_cols_scan is not None and low_mean is not None)

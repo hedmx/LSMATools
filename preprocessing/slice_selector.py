@@ -232,13 +232,15 @@ def _process_single_slice(data, h_img, w_img, idx, pixel_spacing):
                     _reg_left_cols.append(int(_rc[0]))
             _left_ok = True
             if len(_reg_left_cols) >= 3:
-                _max_jump = max(abs(_reg_left_cols[i] - _reg_left_cols[i - 1])
-                               for i in range(1, len(_reg_left_cols)))
-                _jump_limit = max(3, 0.20 * _med_reg_w)
-                if _max_jump > _jump_limit:
+                _jump_limit = max(3, 0.25 * _med_reg_w)
+                _jumps = [abs(_reg_left_cols[i] - _reg_left_cols[i - 1])
+                         for i in range(1, len(_reg_left_cols))]
+                _max_jump = max(_jumps)
+                _n_exceed = sum(1 for j in _jumps if j > _jump_limit)
+                if _n_exceed >= 3:
                     _left_ok = False
                     print(f"   切片 [第{idx+1}张] Step3 左边界跳变: "
-                          f"max跳变={_max_jump}px > {_jump_limit:.0f}px, 跳过")
+                          f"最大={_max_jump}px, 超门槛({_jump_limit:.1f}px)出现{_n_exceed}次 ≥3, 跳过")
             if not _left_ok:
                 continue
 

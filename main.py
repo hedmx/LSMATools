@@ -310,6 +310,21 @@ def _run_single(nifti_path, metadata_path, output_dir,
         print("   ❌ 未找到IN序列，跳过 mode4")
         return {'status': 'failed', 'stem': stem, 'n_vertebrae': 0}
 
+    # 检测 WFI/IP 序列 (联影)，需要放宽下降沿阈值
+    in_desc = ''
+    if in_meta:
+        in_desc = in_meta.get('series_info', {}).get('series_description', '').lower()
+    is_wfi = ('wfi' in in_desc)
+
+    # WFI 序列终板/汇合点信号对比度偏低，统一放宽下降沿阈值至 25%
+    _jp_low_ratio   = 0.72 if is_wfi else 0.80  # 汇合点检测
+    _ep_drop_ratio  = 0.28 if is_wfi else 0.35  # 终板矩阵扫描
+    _ant_drop_ratio = 0.28 if is_wfi else 0.35  # 前缘扇形扫描
+    _s1_drop_ratio  = 0.16 if is_wfi else 0.20  # S1 骶椎前缘
+    if is_wfi:
+        print(f"   [WFI自适应] 联影IP序列检测到，下降沿阈值放宽25%: "
+              f"jp_low={_jp_low_ratio}, ep_drop={_ep_drop_ratio}, ant_drop={_ant_drop_ratio}")
+
     H_in, W_in = in_img_2d.shape
 
     # Step1
@@ -327,7 +342,7 @@ def _run_single(nifti_path, metadata_path, output_dir,
             print(f"   [Pass{pass_i+1}] offset{off_start:.0f}→{off_end:.0f}mm 重试...")
         junction_pts, anchor_pts_list = scan_endplate_junction_points(
             in_img_2d, c2_rows_mode4, c2_cols_mode4,
-            pixel_spacing, low_mean,
+            pixel_spacing, low_mean, low_ratio=_jp_low_ratio,
             offset_start_mm=off_start, offset_end_mm=off_end)
         if len(junction_pts) >= 2:
             break
@@ -445,7 +460,7 @@ def _run_single(nifti_path, metadata_path, output_dir,
                     in_img_2d, vc, _j_top, _j_bot,
                     c2_rows_mode4, c2_cols_mode4, pixel_spacing,
                     low_mean, high_mean, scan_up_mm=30.0, scan_dn_mm=30.0,
-                    drop_ratio=0.35)
+                    drop_ratio=_ep_drop_ratio)
                 _sup_pts = _sr['sup_pts']
                 _inf_pts = _sr['inf_pts']
             
@@ -455,9 +470,9 @@ def _run_single(nifti_path, metadata_path, output_dir,
             _ant_scan_fn = _scan_normal_descent_ant_diag if _ant_diag else _scan_normal_descent_ant
             _ant_angle_deg = _calc_ant_angle_deg(vc, c2_rows_mode4, c2_cols_mode4, _disc_top, _disc_bot)
             # S1 前缘信号对比度低，单独放宽下降沿阈值
-            _ant_drop = 0.20 if _ant_diag else 0.35
+            _ant_drop = _s1_drop_ratio if _ant_diag else _ant_drop_ratio
             if _ant_diag:
-                print(f"      [前缘S1] drop_ratio={_ant_drop:.2f} (全局0.35)")
+                print(f"      [前缘S1] drop_ratio={_ant_drop:.2f} (全局{_ant_drop_ratio:.2f})")
             ant_pts, ant_dirs = _fan_scan_direction(
                 float(vc[0]), float(vc[1]),
                 _ant_angle_deg,
@@ -486,8 +501,8 @@ def _run_single(nifti_path, metadata_path, output_dir,
                 scan_up_mm=30.0, scan_dn_mm=30.0, scan_ant_mm=40.0,
                 low_ratio=1.3,
                 high_mean=high_mean,
-                drop_ratio=0.25,
-                ant_drop_ratio=0.35,
+                drop_ratio=_ep_drop_ratio,
+                ant_drop_ratio=_ant_drop_ratio,
                 disc_top=_disc_top, disc_bot=_disc_bot,
                 fan_half_ep_deg=60.0,
                 ant_low_mean=_ant_low_mean,
