@@ -563,5 +563,29 @@ GitHub repository, https://github.com/hedmx/LSMATools.
 
 ---
 
-**最后更新**: 2026-05-07  
-**版本**: V15.5
+## 附录: 性能分析模块 (Analysis Module)
+
+`analysis/` 是独立的数据分析子模块，用于评估分割性能并生成分析报告。支持 DICE、IoU、HD95、ASD、ICC(2,1)、检出率等全套指标。
+
+```bash
+# CLI 一键分析
+python -m analysis.run_analysis --input-dir /path/to/batch_output
+
+# 可选: 跳过形态学分析
+python -m analysis.run_analysis --input-dir /path/to/batch_output --skip-geom
+```
+
+| 输入要求 | 说明 |
+|------|------|
+| `*_seg.nii.gz` | WIFS 输出的多标签分割掩膜 |
+| `Roigstd.zip` | 金标准 Fiji ROI 手工标注 |
+| `Roigstd1.zip` | 可选: 第二审核者标注 (启用双金标准模式) |
+| `*_geom.csv` | 可选: 形态学对比数据 |
+
+输出: `dice_detail.csv`, `lumbar_dice_detail.csv`, `metrics_detail.csv`, `icc_*.csv`, `geom_comparison.csv`, `分析报告.md/.html`。
+
+详细文档: `analysis/使用说明文档.md`。
+
+---
+
+**最后更新**: 2026-05
